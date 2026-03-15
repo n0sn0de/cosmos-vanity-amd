@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -214,12 +214,16 @@ fn main() -> Result<()> {
                 SearchMode::Cpu => "cpu",
             };
 
+            // Calculate difficulty estimate
+            let (expected_candidates, difficulty_label) = estimate_difficulty(&vanity_pattern);
+
             println!("🔍 Cosmos Vanity Address Search");
             println!("   Pattern:  {vanity_pattern}");
             println!("   HRP:      {hrp}");
             println!("   Threads:  {}", config.num_threads);
             println!("   Mode:     {mode_label}");
             println!("   Max hits: {max_matches}");
+            println!("   Difficulty: ~{} avg candidates ({})", format_number(expected_candidates), difficulty_label);
             println!();
 
             let mut searcher = VanitySearcher::new(config)?;
@@ -280,14 +284,63 @@ fn main() -> Result<()> {
             let pb_clone = pb.clone();
             let counter_clone = counter.clone();
             let stop_for_progress = searcher.stop_flag();
+            let search_start = Instant::now();
             std::thread::spawn(move || {
+                let mut last_count: u64 = 0;
+                let mut last_time = search_start;
+                let mut smoothed_rate: f64 = 0.0;
+
+                // Let it warm up for 1 second before showing ETA
+                std::thread::sleep(Duration::from_secs(1));
+
                 loop {
                     if stop_for_progress.load(Ordering::Relaxed) {
                         break;
                     }
                     let checked = counter_clone.load(Ordering::Relaxed);
-                    pb_clone.set_message(format!("{checked} candidates checked"));
-                    std::thread::sleep(Duration::from_millis(200));
+                    let now = Instant::now();
+                    let dt = now.duration_since(last_time).as_secs_f64();
+
+                    if dt > 0.0 {
+                        let instant_rate = (checked - last_count) as f64 / dt;
+                        // Exponential moving average for smooth display
+                        if smoothed_rate == 0.0 {
+                            smoothed_rate = instant_rate;
+                        } else {
+                            smoothed_rate = smoothed_rate * 0.7 + instant_rate * 0.3;
+                        }
+                    }
+
+                    last_count = checked;
+                    last_time = now;
+
+                    let elapsed = search_start.elapsed().as_secs_f64();
+                    let overall_rate = if elapsed > 0.0 { checked as f64 / elapsed } else { 0.0 };
+
+                    let eta_str = if smoothed_rate > 0.0 && expected_candidates > checked {
+                        let remaining = expected_candidates - checked;
+                        let eta_secs = remaining as f64 / smoothed_rate;
+                        format_duration(eta_secs)
+                    } else if checked >= expected_candidates {
+                        "any moment...".to_string()
+                    } else {
+                        "calculating...".to_string()
+                    };
+
+                    let progress_pct = if expected_candidates > 0 {
+                        ((checked as f64 / expected_candidates as f64) * 100.0).min(999.9)
+                    } else {
+                        0.0
+                    };
+
+                    pb_clone.set_message(format!(
+                        "{} checked | {}/s | {:.1}% of avg | ETA: {}",
+                        format_number(checked),
+                        format_number(overall_rate as u64),
+                        progress_pct,
+                        eta_str,
+                    ));
+                    std::thread::sleep(Duration::from_millis(500));
                 }
             });
 
@@ -456,4 +509,73 @@ fn ctrlc_handler(stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         eprintln!("\n⚡ Interrupted — saving state and exiting...");
         stop_flag.store(true, Ordering::Relaxed);
     });
+}
+
+/// Estimate the expected number of candidates to check for a pattern.
+/// Bech32 has 32 characters, so prefix of length N → 32^N expected candidates.
+fn estimate_difficulty(pattern: &VanityPattern) -> (u64, String) {
+    match pattern {
+        VanityPattern::Prefix(p) => {
+            let n = p.len();
+            let expected = 32u64.saturating_pow(n as u32);
+            let label = match n {
+                1 => "trivial — seconds".to_string(),
+                2 => "easy — seconds".to_string(),
+                3 => "moderate — seconds to minutes".to_string(),
+                4 => "hard — minutes".to_string(),
+                5 => "very hard — minutes to hours".to_string(),
+                6 => "extreme — hours to days".to_string(),
+                _ => format!("insane — {n} chars, good luck"),
+            };
+            (expected, label)
+        }
+        VanityPattern::Suffix(s) => {
+            let n = s.len();
+            let expected = 32u64.saturating_pow(n as u32);
+            (expected, format!("{n}-char suffix"))
+        }
+        VanityPattern::Contains(s) => {
+            // Contains is easier than prefix — roughly 32^N / address_len
+            let n = s.len();
+            let expected = 32u64.saturating_pow(n as u32) / 38; // ~38 chars in a cosmos address
+            (expected.max(1), format!("{n}-char contains"))
+        }
+        VanityPattern::Regex(_) => {
+            (0, "regex — cannot estimate".to_string())
+        }
+    }
+}
+
+/// Format a large number with comma separators.
+fn format_number(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
+}
+
+/// Format seconds into human-readable duration.
+fn format_duration(secs: f64) -> String {
+    if secs < 1.0 {
+        "< 1s".to_string()
+    } else if secs < 60.0 {
+        format!("{:.0}s", secs)
+    } else if secs < 3600.0 {
+        let m = (secs / 60.0).floor();
+        let s = secs % 60.0;
+        format!("{:.0}m {:.0}s", m, s)
+    } else if secs < 86400.0 {
+        let h = (secs / 3600.0).floor();
+        let m = ((secs % 3600.0) / 60.0).floor();
+        format!("{:.0}h {:.0}m", h, m)
+    } else {
+        let d = (secs / 86400.0).floor();
+        let h = ((secs % 86400.0) / 3600.0).floor();
+        format!("{:.0}d {:.0}h", d, h)
+    }
 }
