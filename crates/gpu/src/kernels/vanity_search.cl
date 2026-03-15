@@ -91,13 +91,10 @@ void sha256_33bytes(__global const uchar *input, uint *hash) {
     W[33 / 4] |= 0x80 << (24 - (33 % 4) * 8);
     W[15] = 33 * 8; // bit length
 
-    // Expand
+    // Expand (σ0/σ1 use right-rotates and right-shifts)
     for (int i = 16; i < 64; i++) {
-        uint s0 = rotate_left(W[i-15], 32-7) ^ rotate_left(W[i-15], 32-18) ^ (W[i-15] >> 3);
-        uint s1 = rotate_left(W[i-2], 32-17) ^ rotate_left(W[i-2], 32-19) ^ (W[i-2] >> 10);
-        // Fix: use right rotate
-        s0 = (W[i-15] >> 7 | W[i-15] << 25) ^ (W[i-15] >> 18 | W[i-15] << 14) ^ (W[i-15] >> 3);
-        s1 = (W[i-2] >> 17 | W[i-2] << 15) ^ (W[i-2] >> 19 | W[i-2] << 13) ^ (W[i-2] >> 10);
+        uint s0 = (W[i-15] >> 7 | W[i-15] << 25) ^ (W[i-15] >> 18 | W[i-15] << 14) ^ (W[i-15] >> 3);
+        uint s1 = (W[i-2] >> 17 | W[i-2] << 15) ^ (W[i-2] >> 19 | W[i-2] << 13) ^ (W[i-2] >> 10);
         W[i] = W[i-16] + s0 + W[i-7] + s1;
     }
 
@@ -174,12 +171,13 @@ void ripemd160_32bytes(uint *sha_hash, uint *rmd_hash) {
         ar = er; er = dr; dr = rotate_left(cr, 10); cr = br; br = tr;
     }
 
-    uint t = 0x67452301 + cl + dr;
-    rmd_hash[0] = 0xefcdab89 + dl + er;
-    rmd_hash[1] = 0x98badcfe + el + ar;
-    rmd_hash[2] = 0x10325476 + al + br;
-    rmd_hash[3] = 0xc3d2e1f0 + bl + cr;
-    rmd_hash[4] = t;
+    // Finalization: h0' = h1+cl+dr, h1' = h2+dl+er, h2' = h3+el+ar, h3' = h4+al+br, h4' = h0+bl+cr
+    uint t = 0xefcdab89 + cl + dr;
+    rmd_hash[0] = t;
+    rmd_hash[1] = 0x98badcfe + dl + er;
+    rmd_hash[2] = 0x10325476 + el + ar;
+    rmd_hash[3] = 0xc3d2e1f0 + al + br;
+    rmd_hash[4] = 0x67452301 + bl + cr;
 }
 
 // Main kernel: compute address hashes from compressed public keys

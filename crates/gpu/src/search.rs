@@ -8,7 +8,7 @@ use std::time::Instant;
 use chrono::Utc;
 use crossbeam_channel::{bounded, Receiver};
 
-use cosmos_vanity_address::{pubkey_to_bech32, VanityPattern};
+use cosmos_vanity_address::{encode_bech32, pubkey_to_bech32, VanityPattern};
 use cosmos_vanity_keyderiv::generate_random_keypair_with_path;
 
 use crate::state::SearchState;
@@ -247,6 +247,127 @@ impl VanitySearcher {
 
         // Drop our copy of tx so the channel closes when all workers finish
         drop(tx);
+
+        Ok(rx)
+    }
+
+    /// Run the search using GPU acceleration with CPU key generation.
+    ///
+    /// CPU generates keys in batches, GPU computes SHA256→RIPEMD160 hashes,
+    /// CPU checks bech32 pattern matches and verifies.
+    #[cfg(feature = "opencl")]
+    pub fn search_gpu(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
+        use crate::opencl::GpuContext;
+
+        let gpu_ctx = GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init failed: {e}"))?;
+        let batch_size = gpu_ctx.suggested_batch_size();
+
+        tracing::info!(
+            "Starting GPU-accelerated search on {} (batch size: {}, CUs: {}), pattern: {}, hrp: {}",
+            gpu_ctx.device_name(),
+            batch_size,
+            gpu_ctx.max_compute_units(),
+            self.config.pattern,
+            self.config.hrp,
+        );
+
+        // Validate pattern charset early
+        self.config.pattern.validate_bech32_charset()?;
+
+        let (tx, rx) = bounded::<SearchResult>(32);
+        let start = Instant::now();
+        let pattern = self.config.pattern.clone();
+        let hrp = self.config.hrp.clone();
+        let path = self.config.derivation_path.clone();
+        let max_matches = self.config.max_matches;
+        let counter = Arc::clone(&self.candidates_checked);
+        let stop_flag = Arc::clone(&self.should_stop);
+
+        std::thread::Builder::new()
+            .name("gpu-search-driver".to_string())
+            .spawn(move || {
+                let mut matches_found: u64 = 0;
+
+                loop {
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if max_matches > 0 && matches_found >= max_matches as u64 {
+                        break;
+                    }
+
+                    // Generate batch of keys on CPU
+                    let mut pubkeys_flat = Vec::with_capacity(batch_size * 33);
+                    let mut mnemonics = Vec::with_capacity(batch_size);
+                    let mut paths = Vec::with_capacity(batch_size);
+
+                    for _ in 0..batch_size {
+                        match generate_random_keypair_with_path(&path) {
+                            Ok(key) => {
+                                pubkeys_flat.extend_from_slice(key.public_key_bytes());
+                                mnemonics.push(key.mnemonic().to_string());
+                                paths.push(key.derivation_path().to_string());
+                            }
+                            Err(e) => {
+                                tracing::error!("Key generation error: {e}");
+                                continue;
+                            }
+                        }
+                    }
+
+                    let actual_batch = mnemonics.len();
+                    if actual_batch == 0 {
+                        continue;
+                    }
+
+                    // Send pubkeys to GPU for hashing
+                    let hashes = match gpu_ctx.hash_pubkeys_batch(&pubkeys_flat) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            tracing::error!("GPU hashing error: {e}");
+                            continue;
+                        }
+                    };
+
+                    let batch_start = counter.fetch_add(actual_batch as u64, Ordering::Relaxed);
+
+                    // Check each hash against the pattern (bech32 encode on CPU)
+                    for i in 0..actual_batch {
+                        let hash_bytes: [u8; 20] = hashes[i * 20..(i + 1) * 20]
+                            .try_into()
+                            .expect("20 bytes");
+
+                        let address = match encode_bech32(&hrp, &hash_bytes) {
+                            Ok(a) => a,
+                            Err(_) => continue,
+                        };
+
+                        if pattern.matches(&address, &hrp) {
+                            let candidate_num = batch_start + i as u64;
+                            let elapsed = start.elapsed().as_secs_f64();
+                            tracing::info!(
+                                "🎯 GPU Match found! Address: {} (candidate #{})",
+                                address,
+                                candidate_num
+                            );
+
+                            matches_found += 1;
+
+                            let result = SearchResult {
+                                address,
+                                mnemonic: mnemonics[i].clone(),
+                                derivation_path: paths[i].clone(),
+                                candidate_number: candidate_num,
+                                elapsed_secs: elapsed,
+                            };
+
+                            if tx.send(result).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            })?;
 
         Ok(rx)
     }

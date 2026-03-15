@@ -200,7 +200,29 @@ fn main() -> Result<()> {
                     .expect("template"),
             );
 
-            let rx = searcher.search_cpu()?;
+            let rx = if gpu {
+                #[cfg(feature = "opencl")]
+                {
+                    match searcher.search_gpu() {
+                        Ok(rx) => {
+                            println!("   Engine:   GPU (OpenCL)");
+                            println!();
+                            rx
+                        }
+                        Err(e) => {
+                            eprintln!("⚠️  GPU init failed ({e}), falling back to CPU");
+                            searcher.search_cpu()?
+                        }
+                    }
+                }
+                #[cfg(not(feature = "opencl"))]
+                {
+                    eprintln!("⚠️  OpenCL support not compiled in, falling back to CPU");
+                    searcher.search_cpu()?
+                }
+            } else {
+                searcher.search_cpu()?
+            };
 
             // Progress update loop in a separate thread
             let pb_clone = pb.clone();
