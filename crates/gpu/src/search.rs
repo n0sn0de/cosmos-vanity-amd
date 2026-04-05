@@ -8,10 +8,15 @@ use std::time::Instant;
 use chrono::Utc;
 use crossbeam_channel::{bounded, Receiver};
 
-use cosmos_vanity_address::{encode_bech32, pubkey_to_bech32, VanityPattern};
-use cosmos_vanity_keyderiv::{generate_random_keypair_with_path, generate_random_keypair_with_words};
+#[cfg(any(feature = "opencl", feature = "cuda"))]
+use cosmos_vanity_address::encode_bech32;
+use cosmos_vanity_address::{pubkey_to_bech32, VanityPattern};
+use cosmos_vanity_keyderiv::generate_random_keypair_with_words;
 
 use crate::state::SearchState;
+
+#[cfg(any(feature = "opencl", feature = "cuda"))]
+use crate::backend::ActiveGpuContext;
 
 /// Key generation mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +40,33 @@ impl std::fmt::Display for KeyMode {
         match self {
             KeyMode::Raw => write!(f, "raw"),
             KeyMode::Mnemonic => write!(f, "mnemonic"),
+        }
+    }
+}
+
+/// Preferred GPU backend API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuApi {
+    /// Prefer CUDA when available, otherwise fall back to OpenCL.
+    Auto,
+    /// Force OpenCL.
+    OpenCl,
+    /// Force CUDA.
+    Cuda,
+}
+
+impl Default for GpuApi {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl std::fmt::Display for GpuApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::OpenCl => write!(f, "opencl"),
+            Self::Cuda => write!(f, "cuda"),
         }
     }
 }
@@ -85,6 +117,9 @@ pub struct SearchConfig {
     /// Key generation mode
     pub key_mode: KeyMode,
 
+    /// Preferred GPU backend API.
+    pub gpu_api: GpuApi,
+
     /// Mnemonic word count: 12 (128-bit) or 24 (256-bit)
     pub mnemonic_words: u8,
 
@@ -107,6 +142,7 @@ impl Default for SearchConfig {
             num_threads: num_cpus::get(),
             mode: SearchMode::Cpu,
             key_mode: KeyMode::default(),
+            gpu_api: GpuApi::default(),
             mnemonic_words: 12,
             max_matches: 1,
             checkpoint_interval: 100_000,
@@ -326,16 +362,15 @@ impl VanitySearcher {
     ///   then does bech32 encode + pattern match on CPU
     ///
     /// This ensures we never lose CPU throughput — the GPU path is purely additive.
-    #[cfg(feature = "opencl")]
+    #[cfg(any(feature = "opencl", feature = "cuda"))]
     pub fn search_hybrid(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
-        use crate::opencl::GpuContext;
-
-        let gpu_ctx = GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init failed: {e}"))?;
+        let gpu_ctx = ActiveGpuContext::new(self.config.gpu_api)?;
         // Use larger batches to amortize kernel launch overhead
         let batch_size = (gpu_ctx.suggested_batch_size()).max(32_768);
 
         tracing::info!(
-            "Starting hybrid GPU+CPU search on {} (batch size: {}, CUs: {}), pattern: {}, hrp: {}",
+            "Starting hybrid {} search on {} (batch size: {}, CUs: {}), pattern: {}, hrp: {}",
+            gpu_ctx.backend_name(),
             gpu_ctx.device_name(),
             batch_size,
             gpu_ctx.max_compute_units(),
@@ -360,7 +395,11 @@ impl VanitySearcher {
         let matches_found = Arc::new(AtomicU64::new(self.state.matches_found));
 
         // --- Phase 1: Spawn N-1 CPU worker threads doing full independent search ---
-        let cpu_search_threads = if num_cpu_threads > 1 { num_cpu_threads - 1 } else { 0 };
+        let cpu_search_threads = if num_cpu_threads > 1 {
+            num_cpu_threads - 1
+        } else {
+            0
+        };
 
         tracing::info!(
             "Hybrid mode: {} CPU search threads + {} GPU keygen threads + 1 GPU driver",
@@ -511,8 +550,7 @@ impl VanitySearcher {
                     if gpu_stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    if max_matches > 0
-                        && gpu_matches.load(Ordering::Relaxed) >= max_matches as u64
+                    if max_matches > 0 && gpu_matches.load(Ordering::Relaxed) >= max_matches as u64
                     {
                         break;
                     }
@@ -554,13 +592,11 @@ impl VanitySearcher {
                         }
                     };
 
-                    let batch_start =
-                        gpu_counter.fetch_add(actual_batch as u64, Ordering::Relaxed);
+                    let batch_start = gpu_counter.fetch_add(actual_batch as u64, Ordering::Relaxed);
 
                     for i in 0..actual_batch {
-                        let hash_bytes: [u8; 20] = hashes[i * 20..(i + 1) * 20]
-                            .try_into()
-                            .expect("20 bytes");
+                        let hash_bytes: [u8; 20] =
+                            hashes[i * 20..(i + 1) * 20].try_into().expect("20 bytes");
 
                         let address = match encode_bech32(&gpu_hrp, &hash_bytes) {
                             Ok(a) => a,
@@ -611,16 +647,15 @@ impl VanitySearcher {
     /// - Only matches need CPU-side bech32 verification
     /// - Large batch sizes (64K-128K) to maximize GPU occupancy
     /// - Atomic match counter for early termination
-    #[cfg(feature = "opencl")]
+    #[cfg(any(feature = "opencl", feature = "cuda"))]
     pub fn search_gpu_pure(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
-        use crate::opencl::GpuContext;
-
-        let gpu_ctx = GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init failed: {e}"))?;
+        let gpu_ctx = ActiveGpuContext::new(self.config.gpu_api)?;
         // Pure GPU mode uses larger batches for max occupancy
         let batch_size = gpu_ctx.pure_gpu_batch_size();
 
         tracing::info!(
-            "Starting PURE GPU search on {} (batch size: {}, CUs: {}), pattern: {}, hrp: {}",
+            "Starting PURE {} search on {} (batch size: {}, CUs: {}), pattern: {}, hrp: {}",
+            gpu_ctx.backend_name(),
             gpu_ctx.device_name(),
             batch_size,
             gpu_ctx.max_compute_units(),
@@ -748,8 +783,7 @@ impl VanitySearcher {
                     if gpu_stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    if max_matches > 0
-                        && gpu_matches.load(Ordering::Relaxed) >= max_matches as u64
+                    if max_matches > 0 && gpu_matches.load(Ordering::Relaxed) >= max_matches as u64
                     {
                         break;
                     }
@@ -795,9 +829,8 @@ impl VanitySearcher {
 
                     // Process GPU results — pattern match on CPU (bech32 encode only candidates)
                     for i in 0..actual_batch_a {
-                        let hash_bytes: [u8; 20] = hashes[i * 20..(i + 1) * 20]
-                            .try_into()
-                            .expect("20 bytes");
+                        let hash_bytes: [u8; 20] =
+                            hashes[i * 20..(i + 1) * 20].try_into().expect("20 bytes");
 
                         let address = match encode_bech32(&gpu_hrp, &hash_bytes) {
                             Ok(a) => a,
@@ -858,12 +891,11 @@ impl VanitySearcher {
     /// - GPU does secp256k1 scalar multiplication + SHA-256 + RIPEMD-160
     /// - On match, returns hex private key
     /// - No BIP-39/BIP-32 overhead
-    #[cfg(feature = "opencl")]
+    #[cfg(any(feature = "opencl", feature = "cuda"))]
     pub fn search_gpu_raw(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
-        use crate::opencl::GpuContext;
         use rand::RngCore;
 
-        let gpu_ctx = GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init failed: {e}"))?;
+        let gpu_ctx = ActiveGpuContext::new(self.config.gpu_api)?;
 
         if !gpu_ctx.has_secp256k1_kernel() {
             return Err(anyhow::anyhow!("secp256k1 GPU kernel not available"));
@@ -872,7 +904,8 @@ impl VanitySearcher {
         let batch_size = gpu_ctx.pure_gpu_batch_size();
 
         tracing::info!(
-            "Starting RAW GPU search on {} (batch size: {}, CUs: {}), pattern: {}, hrp: {}",
+            "Starting RAW {} search on {} (batch size: {}, CUs: {}), pattern: {}, hrp: {}",
+            gpu_ctx.backend_name(),
             gpu_ctx.device_name(),
             batch_size,
             gpu_ctx.max_compute_units(),
@@ -914,8 +947,7 @@ impl VanitySearcher {
                     if gpu_stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    if max_matches > 0
-                        && gpu_matches.load(Ordering::Relaxed) >= max_matches as u64
+                    if max_matches > 0 && gpu_matches.load(Ordering::Relaxed) >= max_matches as u64
                     {
                         break;
                     }
@@ -934,26 +966,26 @@ impl VanitySearcher {
                             }
                         };
 
-                    let batch_start =
-                        gpu_counter.fetch_add(batch_size as u64, Ordering::Relaxed);
+                    let batch_start = gpu_counter.fetch_add(batch_size as u64, Ordering::Relaxed);
 
                     // Pattern match on CPU (bech32 encode + check)
                     for i in 0..batch_size {
-                        let hash_bytes: [u8; 20] = hashes[i * 20..(i + 1) * 20]
-                            .try_into()
-                            .expect("20 bytes");
+                        let hash_bytes: [u8; 20] =
+                            hashes[i * 20..(i + 1) * 20].try_into().expect("20 bytes");
 
-                        let address = match cosmos_vanity_address::encode_bech32(&gpu_hrp, &hash_bytes) {
-                            Ok(a) => a,
-                            Err(_) => continue,
-                        };
+                        let address =
+                            match cosmos_vanity_address::encode_bech32(&gpu_hrp, &hash_bytes) {
+                                Ok(a) => a,
+                                Err(_) => continue,
+                            };
 
                         if gpu_pattern.matches(&address, &gpu_hrp) {
                             let candidate_num = batch_start + i as u64;
                             let elapsed = start.elapsed().as_secs_f64();
 
                             // Extract the private key hex
-                            let privkey_hex = format!("0x{}", hex::encode(&privkeys[i * 32..(i + 1) * 32]));
+                            let privkey_hex =
+                                format!("0x{}", hex::encode(&privkeys[i * 32..(i + 1) * 32]));
 
                             tracing::info!(
                                 "🎯 GPU Raw Match! Address: {} (candidate #{})",
@@ -988,12 +1020,11 @@ impl VanitySearcher {
 
     /// Run the search using GPU-accelerated mnemonic pipeline.
     /// CPU generates mnemonics (fast word lookup), GPU does PBKDF2 + BIP-32 + secp256k1 + hash.
-    #[cfg(feature = "opencl")]
+    #[cfg(any(feature = "opencl", feature = "cuda"))]
     pub fn search_gpu_mnemonic(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
-        use crate::opencl::GpuContext;
         use cosmos_vanity_keyderiv::bip39::Mnemonic;
 
-        let gpu_ctx = GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init failed: {e}"))?;
+        let gpu_ctx = ActiveGpuContext::new(self.config.gpu_api)?;
 
         if !gpu_ctx.has_mnemonic_kernel() {
             return Err(anyhow::anyhow!("Mnemonic pipeline kernel not available"));
@@ -1002,7 +1033,8 @@ impl VanitySearcher {
         let batch_size = gpu_ctx.mnemonic_batch_size();
 
         tracing::info!(
-            "Starting GPU MNEMONIC search on {} (batch size: {}, CUs: {}), pattern: {}, hrp: {}",
+            "Starting {} mnemonic search on {} (batch size: {}, CUs: {}), pattern: {}, hrp: {}",
+            gpu_ctx.backend_name(),
             gpu_ctx.device_name(),
             batch_size,
             gpu_ctx.max_compute_units(),
@@ -1041,22 +1073,34 @@ impl VanitySearcher {
                 .name(format!("mnem-gen-{thread_id}"))
                 .spawn(move || {
                     loop {
-                        if stop_flag.load(Ordering::Relaxed) { break; }
-                        if max_matches > 0 && matches_found.load(Ordering::Relaxed) >= max_matches as u64 { break; }
+                        if stop_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if max_matches > 0
+                            && matches_found.load(Ordering::Relaxed) >= max_matches as u64
+                        {
+                            break;
+                        }
 
                         // Generate random mnemonic — just entropy + word lookup, NO PBKDF2
                         // 12 words = 16 bytes entropy, 24 words = 32 bytes entropy
                         let entropy_len = if mnemonic_words == 12 { 16 } else { 32 };
                         let mut entropy = [0u8; 32];
-                        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut entropy[..entropy_len]);
-                        let mnemonic: Mnemonic = match Mnemonic::from_entropy(&entropy[..entropy_len]) {
-                            Ok(m) => m,
-                            Err(_) => continue,
-                        };
+                        rand::RngCore::fill_bytes(
+                            &mut rand::rngs::OsRng,
+                            &mut entropy[..entropy_len],
+                        );
+                        let mnemonic: Mnemonic =
+                            match Mnemonic::from_entropy(&entropy[..entropy_len]) {
+                                Ok(m) => m,
+                                Err(_) => continue,
+                            };
                         let mnemonic_str = mnemonic.to_string();
                         let mnemonic_bytes = mnemonic_str.as_bytes().to_vec();
 
-                        if mnem_tx.send((mnemonic_bytes, mnemonic_str)).is_err() { break; }
+                        if mnem_tx.send((mnemonic_bytes, mnemonic_str)).is_err() {
+                            break;
+                        }
                     }
                 })?;
         }
@@ -1071,8 +1115,14 @@ impl VanitySearcher {
                 let mut batch_strings: Vec<String> = Vec::with_capacity(batch_size);
 
                 loop {
-                    if stop_flag.load(Ordering::Relaxed) { break; }
-                    if max_matches > 0 && matches_found.load(Ordering::Relaxed) >= max_matches as u64 { break; }
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if max_matches > 0
+                        && matches_found.load(Ordering::Relaxed) >= max_matches as u64
+                    {
+                        break;
+                    }
 
                     // Fill batch
                     batch_mnemonics_flat.clear();
@@ -1108,29 +1158,29 @@ impl VanitySearcher {
                     }
 
                     let actual_batch = batch_lens.len();
-                    if actual_batch == 0 { continue; }
+                    if actual_batch == 0 {
+                        continue;
+                    }
 
                     // Dispatch to GPU
-                    let (privkeys, hashes, _matches) = match gpu_ctx.mnemonic_batch(
-                        &batch_mnemonics_flat,
-                        &batch_lens,
-                    ) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::error!("GPU mnemonic batch error: {e}");
-                            continue;
-                        }
-                    };
+                    let (privkeys, hashes, _matches) =
+                        match gpu_ctx.mnemonic_batch(&batch_mnemonics_flat, &batch_lens) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::error!("GPU mnemonic batch error: {e}");
+                                continue;
+                            }
+                        };
 
                     let batch_start = counter.fetch_add(actual_batch as u64, Ordering::Relaxed);
 
                     // Check each result against pattern
                     for i in 0..actual_batch {
-                        let hash_bytes: [u8; 20] = hashes[i * 20..(i + 1) * 20]
-                            .try_into()
-                            .expect("20 bytes");
+                        let hash_bytes: [u8; 20] =
+                            hashes[i * 20..(i + 1) * 20].try_into().expect("20 bytes");
 
-                        let address = match cosmos_vanity_address::encode_bech32(&hrp, &hash_bytes) {
+                        let address = match cosmos_vanity_address::encode_bech32(&hrp, &hash_bytes)
+                        {
                             Ok(a) => a,
                             Err(_) => continue,
                         };
@@ -1140,7 +1190,8 @@ impl VanitySearcher {
                             let elapsed = start.elapsed().as_secs_f64();
                             tracing::info!(
                                 "🎯 GPU Mnemonic Match! Address: {} (candidate #{})",
-                                address, candidate_num
+                                address,
+                                candidate_num
                             );
 
                             matches_found.fetch_add(1, Ordering::Relaxed);
@@ -1154,7 +1205,9 @@ impl VanitySearcher {
                                 private_key_hex: Some(hex::encode(&privkeys[i * 32..(i + 1) * 32])),
                             };
 
-                            if result_tx.send(result).is_err() { return; }
+                            if result_tx.send(result).is_err() {
+                                return;
+                            }
                         }
                     }
                 }
@@ -1178,7 +1231,7 @@ impl VanitySearcher {
 
 /// Fill a batch buffer from the keygen channel.
 /// Returns true if there's more data available (channel still open), false if channel closed.
-#[cfg(feature = "opencl")]
+#[cfg(any(feature = "opencl", feature = "cuda"))]
 fn fill_batch(
     keygen_rx: &Receiver<(Vec<u8>, String, String)>,
     pubkeys: &mut Vec<u8>,
@@ -1254,6 +1307,7 @@ mod tests {
             num_threads: 2,
             mode: SearchMode::Cpu,
             key_mode: KeyMode::Mnemonic,
+            gpu_api: GpuApi::Auto,
             mnemonic_words: 12,
             max_matches: 1,
             checkpoint_interval: 1000,

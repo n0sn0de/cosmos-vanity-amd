@@ -12,6 +12,7 @@ path = "src/main.rs"
 [features]
 default = []
 opencl = ["cosmos-vanity-gpu/opencl"]
+cuda = ["cosmos-vanity-gpu/cuda"]
 
 [dependencies]
 cosmos-vanity-keyderiv = { workspace = true }

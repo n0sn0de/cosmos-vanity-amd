@@ -1,6 +1,6 @@
 # cosmos-vanity-amd ⚡
 
-Generate vanity wallet addresses for the Cosmos ecosystem using AMD GPU acceleration via ROCm/OpenCL. Full secp256k1 elliptic curve math and BIP-39/BIP-32 derivation on GPU.
+Generate vanity wallet addresses for the Cosmos ecosystem with GPU acceleration. Supports AMD/ROCm/OpenCL and modern NVIDIA/CUDA backends, including full secp256k1 elliptic curve math and BIP-39/BIP-32 derivation on GPU.
 
 ## Performance
 
@@ -27,16 +27,22 @@ Benchmarked on AMD Radeon RX 9070 XT (gfx1201, 32 CUs, ROCm 7.2):
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │                          CLI (clap)                                  │
-│          --mode gpu|hybrid|cpu  --key-mode raw|mnemonic              │
+│  --mode gpu|hybrid|cpu  --gpu-api auto|opencl|cuda  --key-mode ...   │
 ├────────────┬───────────┬───────────────────┬──────────┬──────────────┤
 │  keyderiv  │  address  │       gpu         │  verify  │    bench     │
 │            │           │                   │          │              │
-│ BIP-39     │ SHA-256   │ OpenCL Kernels:   │ CPU re-  │ Throughput   │
+│ BIP-39     │ SHA-256   │ GPU Kernels:      │ CPU re-  │ Throughput   │
 │ BIP-32/44  │ RIPEMD160 │  • secp256k1.cl   │ derive   │ measurement  │
 │ secp256k1  │ Bech32    │  • vanity_search  │ & verify │              │
 │            │           │  • mnemonic_pipe  │          │              │
 └────────────┴───────────┴───────────────────┴──────────┴──────────────┘
 ```
+
+### GPU Backends
+
+- **OpenCL**: native path for AMD/ROCm and other OpenCL-capable GPUs
+- **CUDA**: NVIDIA path via the CUDA driver + NVRTC
+- **Parity approach**: the CUDA backend reuses the existing OpenCL kernel sources through a thin compatibility preamble, so both backends run the same kernel bodies instead of maintaining two diverging implementations
 
 ### GPU Kernels
 
@@ -99,8 +105,28 @@ sudo usermod -aG render,video $USER
 # Verify GPU is detected
 clinfo | grep "Board name"
 
-# Build with GPU support
+# Build with OpenCL support
 cargo build --release --features opencl
+```
+
+### GPU build (NVIDIA CUDA)
+
+```bash
+# Install the NVIDIA driver and CUDA toolkit with NVRTC available.
+# Ubuntu packages vary by driver/toolkit version; verify these on your box:
+#   nvidia-smi
+#   nvcc --version
+#   ls /usr/lib/x86_64-linux-gnu/libcuda.so* /usr/lib/x86_64-linux-gnu/libnvrtc.so* 2>/dev/null
+
+# Build with CUDA support
+cargo build --release --features cuda
+```
+
+### Multi-backend build
+
+```bash
+# Build both backends; runtime selection prefers CUDA, then OpenCL
+cargo build --release --features "opencl cuda"
 ```
 
 ## Usage
@@ -110,6 +136,12 @@ cargo build --release --features opencl
 ```bash
 # Fastest: raw private key mode (GPU default)
 cosmos-vanity search -p abc
+
+# Force CUDA on NVIDIA
+cosmos-vanity search -p abc --gpu-api cuda
+
+# Force OpenCL
+cosmos-vanity search -p abc --gpu-api opencl
 
 # With mnemonic phrase output (12-word, Keplr compatible)
 cosmos-vanity search -p abc -k mnemonic
@@ -123,6 +155,14 @@ cosmos-vanity search -p cool --hrp osmo
 # CPU only (no GPU needed)
 cosmos-vanity search -p abc -m cpu -k mnemonic
 ```
+
+### GPU backend API (`--gpu-api`)
+
+| API | Flag | Description |
+|-----|------|-------------|
+| **auto** | `--gpu-api auto` | Prefer CUDA when available, otherwise OpenCL |
+| opencl | `--gpu-api opencl` | Force OpenCL |
+| cuda | `--gpu-api cuda` | Force CUDA |
 
 ### Search modes (`--mode`, `-m`)
 
@@ -156,6 +196,7 @@ Options:
   -t, --match-type <TYPE>      prefix (default), suffix, contains, regex
       --hrp <HRP>              Chain prefix: cosmos, osmo, juno, etc. [default: cosmos]
   -m, --mode <MODE>            gpu, hybrid, cpu [default: gpu]
+      --gpu-api <API>          auto, opencl, cuda [default: auto]
   -k, --key-mode <MODE>        raw, mnemonic [default: raw]
   -w, --words <N>              Mnemonic words: 12 or 24 [default: 12]
   -j, --threads <N>            CPU threads [default: all cores]
@@ -228,17 +269,21 @@ ulimit -c 0
 ## Development
 
 ```bash
-# Run all tests
-cargo test --workspace --features opencl
-
 # CPU-only tests (no GPU needed)
 cargo test --workspace
 
-# Lint
-cargo clippy --workspace --features opencl
+# OpenCL validation on available OpenCL hardware
+cargo test --workspace --features opencl
 
-# Build check only
-cargo check --workspace --features opencl
+# CUDA compile + runtime-skip validation (runs real CUDA tests when a CUDA driver is present)
+cargo test -p cosmos-vanity-gpu --features cuda
+
+# Combined build/test surface
+cargo test --workspace --features "opencl cuda"
+
+# Lint / build checks
+cargo clippy --workspace --features "opencl cuda"
+cargo check --workspace --features "opencl cuda"
 ```
 
 ## Crate structure
@@ -248,7 +293,7 @@ cargo check --workspace --features opencl
 | `cli` | Command-line interface, progress display |
 | `keyderiv` | BIP-39 mnemonic, BIP-32/44 HD derivation, secp256k1 |
 | `address` | SHA-256, RIPEMD-160, Bech32 encoding, pattern matching |
-| `gpu` | OpenCL kernel management, GPU search engine, CPU fallback |
+| `gpu` | OpenCL/CUDA kernel management, GPU search engine, CPU fallback |
 | `verify` | Independent CPU verification of matches |
 | `bench` | Benchmarking utilities |
 
