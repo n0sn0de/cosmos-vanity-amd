@@ -36,8 +36,8 @@ pub(crate) fn assert_hash_matches_cpu<B: BackendHarness>(ctx: &B) {
         {
             let mut k = [0u8; 33];
             k[0] = 0x02;
-            for i in 1..33 {
-                k[i] = i as u8;
+            for (i, byte) in k.iter_mut().enumerate().skip(1) {
+                *byte = i as u8;
             }
             k
         },

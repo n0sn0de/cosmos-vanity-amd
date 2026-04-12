@@ -45,9 +45,9 @@ impl ActiveGpuContext {
                             "CUDA backend requested, but no CUDA device is available"
                         ));
                     }
-                    return crate::cuda::GpuContext::new()
+                    crate::cuda::GpuContext::new()
                         .map(Self::Cuda)
-                        .map_err(|err| anyhow::anyhow!("CUDA init failed: {err}"));
+                        .map_err(|err| anyhow::anyhow!("CUDA init failed: {err}"))
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
@@ -64,9 +64,9 @@ impl ActiveGpuContext {
                             "OpenCL backend requested, but no OpenCL GPU is available"
                         ));
                     }
-                    return crate::opencl::GpuContext::new()
+                    crate::opencl::GpuContext::new()
                         .map(Self::OpenCl)
-                        .map_err(|err| anyhow::anyhow!("OpenCL init failed: {err}"));
+                        .map_err(|err| anyhow::anyhow!("OpenCL init failed: {err}"))
                 }
                 #[cfg(not(feature = "opencl"))]
                 {

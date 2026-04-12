@@ -22,6 +22,8 @@ const HASH_SIZE: usize = 20;
 /// Size of a raw private key.
 const PRIVKEY_SIZE: usize = 32;
 
+type GpuBatchResult = (Vec<u8>, Vec<u8>, Vec<u32>);
+
 const CUDA_COMPAT_PREAMBLE: &str = r#"
 typedef unsigned int uint;
 typedef unsigned char uchar;
@@ -290,7 +292,7 @@ impl GpuContext {
         &self,
         privkeys: &[u8],
         prefix_bytes: &[u8],
-    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u32>), GpuError> {
+    ) -> Result<GpuBatchResult, GpuError> {
         let function = self
             .secp256k1_function
             .as_ref()
@@ -349,7 +351,7 @@ impl GpuContext {
         let warps_per_sm = 32;
         let warp_size = 32;
         let base = self.max_compute_units as usize * warps_per_sm * warp_size;
-        base.max(65_536).min(131_072).next_power_of_two()
+        base.clamp(65_536, 131_072).next_power_of_two()
     }
 
     /// Batch size for mnemonic GPU mode.
@@ -357,7 +359,7 @@ impl GpuContext {
         let warps_per_sm = 4;
         let warp_size = 32;
         let base = self.max_compute_units as usize * warps_per_sm * warp_size;
-        base.max(2_048).min(8_192)
+        base.clamp(2_048, 8_192)
     }
 
     /// Run the full mnemonic pipeline on CUDA.
@@ -365,7 +367,7 @@ impl GpuContext {
         &self,
         mnemonics_flat: &[u8],
         mnemonic_lens: &[u32],
-    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u32>), GpuError> {
+    ) -> Result<GpuBatchResult, GpuError> {
         let function = self
             .mnemonic_function
             .as_ref()
@@ -410,7 +412,7 @@ impl GpuContext {
     }
 
     fn launch_config(&self, count: u32) -> LaunchConfig {
-        let block = self.max_threads_per_block.min(256).max(1);
+        let block = self.max_threads_per_block.clamp(1, 256);
         let grid = count.div_ceil(block);
         LaunchConfig {
             grid_dim: (grid, 1, 1),

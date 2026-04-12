@@ -19,20 +19,15 @@ use crate::state::SearchState;
 use crate::backend::ActiveGpuContext;
 
 /// Key generation mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KeyMode {
     /// Raw mode: random 32-byte private key → GPU secp256k1 → GPU hash.
     /// Maximum speed, returns hex private key instead of mnemonic.
+    #[default]
     Raw,
     /// Mnemonic mode: BIP-39 mnemonic → CPU derivation → GPU hash.
     /// Compatible with standard wallets, returns 24-word mnemonic.
     Mnemonic,
-}
-
-impl Default for KeyMode {
-    fn default() -> Self {
-        KeyMode::Raw
-    }
 }
 
 impl std::fmt::Display for KeyMode {
@@ -45,20 +40,15 @@ impl std::fmt::Display for KeyMode {
 }
 
 /// Preferred GPU backend API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GpuApi {
     /// Prefer CUDA when available, otherwise fall back to OpenCL.
+    #[default]
     Auto,
     /// Force OpenCL.
     OpenCl,
     /// Force CUDA.
     Cuda,
-}
-
-impl Default for GpuApi {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 impl std::fmt::Display for GpuApi {
@@ -395,11 +385,7 @@ impl VanitySearcher {
         let matches_found = Arc::new(AtomicU64::new(self.state.matches_found));
 
         // --- Phase 1: Spawn N-1 CPU worker threads doing full independent search ---
-        let cpu_search_threads = if num_cpu_threads > 1 {
-            num_cpu_threads - 1
-        } else {
-            0
-        };
+        let cpu_search_threads = num_cpu_threads.saturating_sub(1);
 
         tracing::info!(
             "Hybrid mode: {} CPU search threads + {} GPU keygen threads + 1 GPU driver",
@@ -757,20 +743,13 @@ impl VanitySearcher {
                 tracing::debug!("Pure GPU driver thread started (double-buffered)");
 
                 // Double buffer: while GPU processes one batch, CPU fills the other
-                let mut buf_a_pubkeys: Vec<u8> = Vec::with_capacity(batch_size * 33);
-                let mut buf_a_mnemonics: Vec<String> = Vec::with_capacity(batch_size);
-                let mut buf_a_paths: Vec<String> = Vec::with_capacity(batch_size);
-
-                let mut buf_b_pubkeys: Vec<u8> = Vec::with_capacity(batch_size * 33);
-                let mut buf_b_mnemonics: Vec<String> = Vec::with_capacity(batch_size);
-                let mut buf_b_paths: Vec<String> = Vec::with_capacity(batch_size);
+                let mut buf_a = KeyBatch::with_capacity(batch_size);
+                let mut buf_b = KeyBatch::with_capacity(batch_size);
 
                 // Fill first batch (buffer A)
                 if !fill_batch(
                     &keygen_rx,
-                    &mut buf_a_pubkeys,
-                    &mut buf_a_mnemonics,
-                    &mut buf_a_paths,
+                    &mut buf_a,
                     batch_size,
                     &gpu_stop,
                     &gpu_matches,
@@ -788,23 +767,19 @@ impl VanitySearcher {
                         break;
                     }
 
-                    let actual_batch_a = buf_a_mnemonics.len();
+                    let actual_batch_a = buf_a.mnemonics.len();
                     if actual_batch_a == 0 {
                         break;
                     }
 
                     // Dispatch buffer A to GPU
-                    let hashes = match gpu_ctx.hash_pubkeys_batch(&buf_a_pubkeys) {
+                    let hashes = match gpu_ctx.hash_pubkeys_batch(&buf_a.pubkeys) {
                         Ok(h) => h,
                         Err(e) => {
                             tracing::error!("GPU hashing error: {e}");
                             // Try to continue with next batch
-                            buf_a_pubkeys.clear();
-                            buf_a_mnemonics.clear();
-                            buf_a_paths.clear();
-                            std::mem::swap(&mut buf_a_pubkeys, &mut buf_b_pubkeys);
-                            std::mem::swap(&mut buf_a_mnemonics, &mut buf_b_mnemonics);
-                            std::mem::swap(&mut buf_a_paths, &mut buf_b_paths);
+                            buf_a.clear();
+                            std::mem::swap(&mut buf_a, &mut buf_b);
                             continue;
                         }
                     };
@@ -815,9 +790,7 @@ impl VanitySearcher {
                     // CPU pattern matching of A's results with B's keygen.
                     let has_more = fill_batch(
                         &keygen_rx,
-                        &mut buf_b_pubkeys,
-                        &mut buf_b_mnemonics,
-                        &mut buf_b_paths,
+                        &mut buf_b,
                         batch_size,
                         &gpu_stop,
                         &gpu_matches,
@@ -850,8 +823,8 @@ impl VanitySearcher {
 
                             let result = SearchResult {
                                 address,
-                                mnemonic: buf_a_mnemonics[i].clone(),
-                                derivation_path: buf_a_paths[i].clone(),
+                                mnemonic: buf_a.mnemonics[i].clone(),
+                                derivation_path: buf_a.paths[i].clone(),
                                 candidate_number: candidate_num,
                                 elapsed_secs: elapsed,
                                 private_key_hex: None,
@@ -864,14 +837,10 @@ impl VanitySearcher {
                     }
 
                     // Swap buffers: B becomes the next batch to dispatch, A becomes the fill target
-                    buf_a_pubkeys.clear();
-                    buf_a_mnemonics.clear();
-                    buf_a_paths.clear();
-                    std::mem::swap(&mut buf_a_pubkeys, &mut buf_b_pubkeys);
-                    std::mem::swap(&mut buf_a_mnemonics, &mut buf_b_mnemonics);
-                    std::mem::swap(&mut buf_a_paths, &mut buf_b_paths);
+                    buf_a.clear();
+                    std::mem::swap(&mut buf_a, &mut buf_b);
 
-                    if !has_more && buf_a_mnemonics.is_empty() {
+                    if !has_more && buf_a.mnemonics.is_empty() {
                         break;
                     }
                 }
@@ -1229,35 +1198,55 @@ impl VanitySearcher {
     }
 }
 
+#[cfg(any(feature = "opencl", feature = "cuda"))]
+struct KeyBatch {
+    pubkeys: Vec<u8>,
+    mnemonics: Vec<String>,
+    paths: Vec<String>,
+}
+
+#[cfg(any(feature = "opencl", feature = "cuda"))]
+impl KeyBatch {
+    fn with_capacity(batch_size: usize) -> Self {
+        Self {
+            pubkeys: Vec::with_capacity(batch_size * 33),
+            mnemonics: Vec::with_capacity(batch_size),
+            paths: Vec::with_capacity(batch_size),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.pubkeys.clear();
+        self.mnemonics.clear();
+        self.paths.clear();
+    }
+}
+
 /// Fill a batch buffer from the keygen channel.
 /// Returns true if there's more data available (channel still open), false if channel closed.
 #[cfg(any(feature = "opencl", feature = "cuda"))]
 fn fill_batch(
     keygen_rx: &Receiver<(Vec<u8>, String, String)>,
-    pubkeys: &mut Vec<u8>,
-    mnemonics: &mut Vec<String>,
-    paths: &mut Vec<String>,
+    batch: &mut KeyBatch,
     batch_size: usize,
     stop_flag: &Arc<AtomicBool>,
     matches_found: &Arc<AtomicU64>,
     max_matches: usize,
 ) -> bool {
-    pubkeys.clear();
-    mnemonics.clear();
-    paths.clear();
+    batch.clear();
 
     // Block on first item
     match keygen_rx.recv() {
         Ok((pubkey, mnemonic, deriv_path)) => {
-            pubkeys.extend_from_slice(&pubkey);
-            mnemonics.push(mnemonic);
-            paths.push(deriv_path);
+            batch.pubkeys.extend_from_slice(&pubkey);
+            batch.mnemonics.push(mnemonic);
+            batch.paths.push(deriv_path);
         }
         Err(_) => return false,
     }
 
     // Fill rest non-blocking
-    while mnemonics.len() < batch_size {
+    while batch.mnemonics.len() < batch_size {
         if stop_flag.load(Ordering::Relaxed) {
             break;
         }
@@ -1266,9 +1255,9 @@ fn fill_batch(
         }
         match keygen_rx.try_recv() {
             Ok((pubkey, mnemonic, deriv_path)) => {
-                pubkeys.extend_from_slice(&pubkey);
-                mnemonics.push(mnemonic);
-                paths.push(deriv_path);
+                batch.pubkeys.extend_from_slice(&pubkey);
+                batch.mnemonics.push(mnemonic);
+                batch.paths.push(deriv_path);
             }
             Err(_) => break,
         }
