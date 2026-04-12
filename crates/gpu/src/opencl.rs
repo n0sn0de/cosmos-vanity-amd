@@ -3,6 +3,7 @@
 //! This module manages the GPU context, compiles the OpenCL kernel,
 //! and provides batch hashing of compressed public keys on AMD GPUs via ROCm.
 
+use ocl::core;
 use ocl::enums::{DeviceInfo, DeviceInfoResult};
 use ocl::{Buffer, Context, Device, Kernel, Platform, Program, Queue};
 use thiserror::Error;
@@ -39,16 +40,25 @@ pub enum GpuError {
     InvalidBatchSize,
 }
 
+fn list_platforms() -> Result<Vec<Platform>, GpuError> {
+    Ok(core::get_platform_ids()
+        .map_err(ocl::Error::from)?
+        .into_iter()
+        .map(Platform::new)
+        .collect())
+}
+
 /// Check if GPU acceleration is available.
 pub fn is_available() -> bool {
-    match Platform::list() {
-        platforms if platforms.is_empty() => false,
-        platforms => platforms.iter().any(|p| {
-            Device::list(p, Some(ocl::flags::DeviceType::GPU))
-                .map(|devs| !devs.is_empty())
-                .unwrap_or(false)
-        }),
-    }
+    let Ok(platforms) = list_platforms() else {
+        return false;
+    };
+
+    platforms.iter().any(|p| {
+        Device::list(p, Some(ocl::flags::DeviceType::GPU))
+            .map(|devs| !devs.is_empty())
+            .unwrap_or(false)
+    })
 }
 
 /// GPU context holding the OpenCL queue, compiled programs, and device info.
@@ -65,7 +75,7 @@ pub struct GpuContext {
 impl GpuContext {
     /// Initialize GPU context — finds an AMD GPU, compiles the kernel.
     pub fn new() -> Result<Self, GpuError> {
-        let platform = Platform::list()
+        let platform = list_platforms()?
             .into_iter()
             .find(|p| {
                 Device::list(p, Some(ocl::flags::DeviceType::GPU))
