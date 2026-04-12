@@ -246,7 +246,7 @@ fn main() -> Result<()> {
             // Determine effective mode — fall back from GPU/hybrid to CPU if no compatible GPU backend is available.
             let effective_mode = resolve_mode(&mode, gpu_api);
 
-            let effective_key_mode = key_mode.to_key_mode();
+            let mut effective_key_mode = key_mode.to_key_mode();
 
             let config = SearchConfig {
                 pattern: vanity_pattern.clone(),
@@ -314,9 +314,12 @@ fn main() -> Result<()> {
                             match searcher.search_gpu_raw() {
                                 Ok(rx) => rx,
                                 Err(e) => {
-                                    eprintln!("⚠️  GPU raw mode failed ({e}), falling back to mnemonic GPU mode");
+                                    eprintln!("⚠️  GPU raw mode failed ({e}), falling back to pure GPU mnemonic mode");
                                     match searcher.search_gpu_pure() {
-                                        Ok(rx) => rx,
+                                        Ok(rx) => {
+                                            effective_key_mode = KeyMode::Mnemonic;
+                                            rx
+                                        }
                                         Err(e2) => {
                                             eprintln!(
                                                 "⚠️  GPU init failed ({e2}), falling back to CPU"

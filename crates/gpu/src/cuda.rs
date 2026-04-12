@@ -5,13 +5,20 @@
 //! behavior-aligned with the existing OpenCL implementation instead of growing
 //! a second, drifting kernel codebase.
 
-use std::sync::Arc;
+use std::{
+    ffi::{CStr, CString},
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use cudarc::driver::{
     result::DriverError, CudaContext as DriverContext, CudaFunction, CudaModule, CudaStream,
     LaunchConfig, PushKernelArg,
 };
-use cudarc::nvrtc::{compile_ptx_with_opts, CompileError, CompileOptions};
+use cudarc::nvrtc::{
+    compile_ptx_with_opts, result as nvrtc_result, sys as nvrtc_sys, CompileError, CompileOptions,
+    Ptx,
+};
 use thiserror::Error;
 use tracing::{debug, info};
 
@@ -70,12 +77,13 @@ pub fn is_available() -> bool {
 
 /// CUDA context holding the stream, compiled modules, and device info.
 pub struct GpuContext {
+    ctx: Arc<DriverContext>,
     stream: Arc<CudaStream>,
     hash_function: CudaFunction,
-    secp256k1_function: Option<CudaFunction>,
+    secp256k1_function: Mutex<Option<CudaFunction>>,
     #[cfg(test)]
-    mnemonic_module: Option<Arc<CudaModule>>,
-    mnemonic_function: Option<CudaFunction>,
+    mnemonic_module: Mutex<Option<Arc<CudaModule>>>,
+    mnemonic_function: Mutex<Option<CudaFunction>>,
     device_name: String,
     max_threads_per_block: u32,
     max_compute_units: u32,
@@ -123,67 +131,14 @@ impl GpuContext {
         );
         info!("CUDA hash kernel compiled successfully");
 
-        let secp256k1_function = match compile_module(
-            &ctx,
-            &cuda_source(&[SECP256K1_KERNEL_SOURCE]),
-            "secp256k1.cu",
-        ) {
-            Ok(module) => match module.load_function("generate_addresses") {
-                Ok(function) => {
-                    info!("CUDA secp256k1 kernel compiled successfully");
-                    Some(function)
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        "Failed to load CUDA secp256k1 kernel: {err}. Raw key mode will be unavailable."
-                    );
-                    None
-                }
-            },
-            Err(err) => {
-                tracing::warn!(
-                    "Failed to compile CUDA secp256k1 kernel: {err}. Raw key mode will be unavailable."
-                );
-                None
-            }
-        };
-
-        let mnemonic_kernel = match compile_module(
-            &ctx,
-            &cuda_source(&[SECP256K1_KERNEL_SOURCE, MNEMONIC_KERNEL_SOURCE]),
-            "mnemonic_pipeline.cu",
-        ) {
-            Ok(module) => match module.load_function("mnemonic_to_address") {
-                Ok(function) => {
-                    info!("CUDA mnemonic pipeline kernel compiled successfully");
-                    (Some(module), Some(function))
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        "Failed to load CUDA mnemonic pipeline kernel: {err}. GPU mnemonic mode will be unavailable."
-                    );
-                    (None, None)
-                }
-            },
-            Err(err) => {
-                tracing::warn!(
-                    "Failed to compile CUDA mnemonic pipeline kernel: {err}. GPU mnemonic mode will be unavailable."
-                );
-                (None, None)
-            }
-        };
-        #[cfg(test)]
-        let (mnemonic_module, mnemonic_function) = mnemonic_kernel;
-        #[cfg(not(test))]
-        let (_mnemonic_module, mnemonic_function) = mnemonic_kernel;
-
         Ok(Self {
+            ctx,
             stream,
             hash_function,
-            secp256k1_function,
+            secp256k1_function: Mutex::new(None),
             #[cfg(test)]
-            mnemonic_module,
-            mnemonic_function,
+            mnemonic_module: Mutex::new(None),
+            mnemonic_function: Mutex::new(None),
             device_name,
             max_threads_per_block,
             max_compute_units,
@@ -202,12 +157,12 @@ impl GpuContext {
 
     /// Check if the secp256k1 kernel is available.
     pub fn has_secp256k1_kernel(&self) -> bool {
-        self.secp256k1_function.is_some()
+        self.ensure_secp256k1_function().is_ok()
     }
 
     /// Check if the mnemonic pipeline kernel is available.
     pub fn has_mnemonic_kernel(&self) -> bool {
-        self.mnemonic_function.is_some()
+        self.ensure_mnemonic_function().is_ok()
     }
 
     /// Compute SHA-256 → RIPEMD-160 hashes for a batch of compressed public keys on CUDA.
@@ -293,10 +248,7 @@ impl GpuContext {
         privkeys: &[u8],
         prefix_bytes: &[u8],
     ) -> Result<GpuBatchResult, GpuError> {
-        let function = self
-            .secp256k1_function
-            .as_ref()
-            .ok_or_else(|| GpuError::Nvrtc("secp256k1 kernel not compiled".to_string()))?;
+        let function = self.ensure_secp256k1_function()?;
 
         let n = privkeys.len() / PRIVKEY_SIZE;
         if n == 0 {
@@ -319,7 +271,7 @@ impl GpuContext {
 
         unsafe {
             self.stream
-                .launch_builder(function)
+                .launch_builder(&function)
                 .arg(&privkey_buf)
                 .arg(&mut pubkey_buf)
                 .arg(&mut hash_buf)
@@ -368,10 +320,7 @@ impl GpuContext {
         mnemonics_flat: &[u8],
         mnemonic_lens: &[u32],
     ) -> Result<GpuBatchResult, GpuError> {
-        let function = self
-            .mnemonic_function
-            .as_ref()
-            .ok_or_else(|| GpuError::Nvrtc("Mnemonic pipeline kernel not compiled".to_string()))?;
+        let function = self.ensure_mnemonic_function()?;
 
         let n = mnemonic_lens.len();
         if n == 0 {
@@ -391,7 +340,7 @@ impl GpuContext {
 
         unsafe {
             self.stream
-                .launch_builder(function)
+                .launch_builder(&function)
                 .arg(&mnemonics_buf)
                 .arg(&lens_buf)
                 .arg(&mut privkeys_buf)
@@ -423,7 +372,79 @@ impl GpuContext {
 
     #[cfg(test)]
     fn mnemonic_module(&self) -> Option<Arc<CudaModule>> {
-        self.mnemonic_module.clone()
+        if self.ensure_mnemonic_function().is_err() {
+            return None;
+        }
+
+        self.mnemonic_module.lock().ok()?.clone()
+    }
+
+    fn ensure_secp256k1_function(&self) -> Result<CudaFunction, GpuError> {
+        if let Some(function) = self
+            .secp256k1_function
+            .lock()
+            .map_err(|_| GpuError::RuntimeUnavailable("CUDA secp256k1 mutex poisoned".into()))?
+            .clone()
+        {
+            return Ok(function);
+        }
+
+        let module = compile_module(
+            &self.ctx,
+            &cuda_source(&[SECP256K1_KERNEL_SOURCE]),
+            "secp256k1.cu",
+        )?;
+        let function = module.load_function("generate_addresses")?;
+        info!("CUDA secp256k1 kernel compiled successfully");
+
+        let mut slot = self
+            .secp256k1_function
+            .lock()
+            .map_err(|_| GpuError::RuntimeUnavailable("CUDA secp256k1 mutex poisoned".into()))?;
+        if let Some(existing) = slot.clone() {
+            return Ok(existing);
+        }
+        *slot = Some(function.clone());
+        Ok(function)
+    }
+
+    fn ensure_mnemonic_function(&self) -> Result<CudaFunction, GpuError> {
+        if let Some(function) = self
+            .mnemonic_function
+            .lock()
+            .map_err(|_| GpuError::RuntimeUnavailable("CUDA mnemonic mutex poisoned".into()))?
+            .clone()
+        {
+            return Ok(function);
+        }
+
+        let module = compile_module(
+            &self.ctx,
+            &cuda_source(&[SECP256K1_KERNEL_SOURCE, MNEMONIC_KERNEL_SOURCE]),
+            "mnemonic_pipeline.cu",
+        )?;
+        let function = module.load_function("mnemonic_to_address")?;
+        info!("CUDA mnemonic pipeline kernel compiled successfully");
+
+        #[cfg(test)]
+        {
+            let mut module_slot = self.mnemonic_module.lock().map_err(|_| {
+                GpuError::RuntimeUnavailable("CUDA mnemonic module mutex poisoned".into())
+            })?;
+            if module_slot.is_none() {
+                *module_slot = Some(module.clone());
+            }
+        }
+
+        let mut function_slot = self
+            .mnemonic_function
+            .lock()
+            .map_err(|_| GpuError::RuntimeUnavailable("CUDA mnemonic mutex poisoned".into()))?;
+        if let Some(existing) = function_slot.clone() {
+            return Ok(existing);
+        }
+        *function_slot = Some(function.clone());
+        Ok(function)
     }
 }
 
@@ -452,27 +473,146 @@ fn compile_module(
     src: &str,
     name: &str,
 ) -> Result<Arc<CudaModule>, GpuError> {
-    let arch = ctx.compute_capability().ok().map(|(major, minor)| {
+    let capability = ctx.compute_capability().ok();
+    let compile_started = Instant::now();
+
+    if let Some((major, minor)) = capability {
+        let sm_arch = format!("sm_{major}{minor}");
+        tracing::info!("Compiling CUDA module {name} for {sm_arch} via CUBIN");
+
+        match compile_cubin_module(ctx, src, name, &sm_arch) {
+            Ok(module) => {
+                tracing::info!(
+                    "Loaded CUDA module {name} via CUBIN in {:.2}s",
+                    compile_started.elapsed().as_secs_f64()
+                );
+                return Ok(module);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "CUBIN compile/load failed for {name} on {sm_arch}: {err}. Falling back to PTX."
+                );
+            }
+        }
+    }
+
+    let arch = capability.map(|(major, minor)| {
         Box::leak(format!("compute_{major}{minor}").into_boxed_str()) as &'static str
     });
 
+    tracing::info!("Compiling CUDA module {name} via PTX fallback");
     let ptx = compile_ptx_with_opts(
         src,
         CompileOptions {
             arch,
             name: Some(name.to_string()),
-            options: vec!["--std=c++14".to_string()],
+            options: vec![
+                "--std=c++14".to_string(),
+                "--device-as-default-execution-space".to_string(),
+            ],
             ..Default::default()
         },
     )?;
 
-    Ok(ctx.load_module(ptx)?)
+    let module = ctx.load_module(ptx)?;
+    tracing::info!(
+        "Loaded CUDA module {name} via PTX in {:.2}s",
+        compile_started.elapsed().as_secs_f64()
+    );
+    Ok(module)
+}
+
+fn compile_cubin_module(
+    ctx: &Arc<DriverContext>,
+    src: &str,
+    name: &str,
+    arch: &str,
+) -> Result<Arc<CudaModule>, GpuError> {
+    let src_c = CString::new(src).expect("CUDA source must not contain NUL bytes");
+    let name_c = CString::new(name).expect("CUDA module name must not contain NUL bytes");
+    let program = nvrtc_result::create_program(src_c.as_c_str(), Some(name_c.as_c_str()))
+        .map_err(|err| GpuError::Nvrtc(format!("NVRTC create_program failed for {name}: {err}")))?;
+
+    let options = vec![
+        "--std=c++14".to_string(),
+        "--device-as-default-execution-space".to_string(),
+        format!("--gpu-architecture={arch}"),
+    ];
+
+    let compile_result = unsafe { nvrtc_result::compile_program(program, &options) };
+    if let Err(err) = compile_result {
+        let log = nvrtc_program_log(program);
+        let _ = unsafe { nvrtc_result::destroy_program(program) };
+        let details = if log.is_empty() {
+            format!("NVRTC CUBIN compile failed for {name} ({arch}): {err}")
+        } else {
+            format!("NVRTC CUBIN compile failed for {name} ({arch}): {err}\n{log}")
+        };
+        return Err(GpuError::Nvrtc(details));
+    }
+
+    let cubin = unsafe { nvrtc_get_cubin(program) }.map_err(|err| {
+        let log = nvrtc_program_log(program);
+        if log.is_empty() {
+            GpuError::Nvrtc(format!("NVRTC get CUBIN failed for {name} ({arch}): {err}"))
+        } else {
+            GpuError::Nvrtc(format!(
+                "NVRTC get CUBIN failed for {name} ({arch}): {err}\n{log}"
+            ))
+        }
+    })?;
+
+    let destroy_result = unsafe { nvrtc_result::destroy_program(program) };
+    if let Err(err) = destroy_result {
+        return Err(GpuError::Nvrtc(format!(
+            "NVRTC destroy_program failed for {name}: {err}"
+        )));
+    }
+
+    Ok(ctx.load_module(Ptx::from_binary(cubin))?)
+}
+
+fn nvrtc_program_log(program: nvrtc_sys::nvrtcProgram) -> String {
+    unsafe { nvrtc_result::get_program_log(program) }
+        .ok()
+        .map(|raw| {
+            unsafe { CStr::from_ptr(raw.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        })
+        .unwrap_or_default()
+}
+
+unsafe fn nvrtc_get_cubin(
+    program: nvrtc_sys::nvrtcProgram,
+) -> Result<Vec<u8>, nvrtc_result::NvrtcError> {
+    let mut size = 0usize;
+    unsafe { nvrtc_sys::nvrtcGetCUBINSize(program, &mut size as *mut _) }.result()?;
+
+    let mut cubin = vec![0u8; size];
+    unsafe { nvrtc_sys::nvrtcGetCUBIN(program, cubin.as_mut_ptr().cast()) }.result()?;
+    Ok(cubin)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend_tests::{self, BackendHarness};
+
+    fn runtime_cuda_ctx(test_name: &str) -> Option<GpuContext> {
+        if !is_available() {
+            eprintln!("CUDA runtime validation skipped for {test_name}: no CUDA device available");
+            return None;
+        }
+
+        Some(
+            GpuContext::new().unwrap_or_else(|err| {
+                panic!(
+                    "CUDA device was detected for {test_name}, but backend initialization failed: {err}"
+                )
+            }),
+        )
+    }
 
     impl BackendHarness for GpuContext {
         fn label(&self) -> &'static str {
@@ -522,72 +662,40 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires explicit CUDA runtime validation"]
     fn test_cuda_hash_matches_cpu() {
-        if !is_available() {
-            eprintln!("No CUDA device available, skipping CUDA hash test");
+        let Some(ctx) = runtime_cuda_ctx("test_cuda_hash_matches_cpu") else {
             return;
-        }
-
-        let ctx = match GpuContext::new() {
-            Ok(ctx) => ctx,
-            Err(err) => {
-                eprintln!("Could not initialize CUDA backend: {err}, skipping");
-                return;
-            }
         };
 
         backend_tests::assert_hash_matches_cpu(&ctx);
     }
 
     #[test]
+    #[ignore = "requires explicit CUDA runtime validation"]
     fn test_cuda_secp256k1_known_vector() {
-        if !is_available() {
-            eprintln!("No CUDA device available, skipping CUDA secp256k1 test");
+        let Some(ctx) = runtime_cuda_ctx("test_cuda_secp256k1_known_vector") else {
             return;
-        }
-
-        let ctx = match GpuContext::new() {
-            Ok(ctx) => ctx,
-            Err(err) => {
-                eprintln!("Could not initialize CUDA backend: {err}, skipping");
-                return;
-            }
         };
 
         backend_tests::assert_secp256k1_known_vector(&ctx);
     }
 
     #[test]
+    #[ignore = "requires explicit CUDA runtime validation"]
     fn test_cuda_secp256k1_matches_cpu() {
-        if !is_available() {
-            eprintln!("No CUDA device available, skipping CUDA secp256k1 CPU parity test");
+        let Some(ctx) = runtime_cuda_ctx("test_cuda_secp256k1_matches_cpu") else {
             return;
-        }
-
-        let ctx = match GpuContext::new() {
-            Ok(ctx) => ctx,
-            Err(err) => {
-                eprintln!("Could not initialize CUDA backend: {err}, skipping");
-                return;
-            }
         };
 
         backend_tests::assert_secp256k1_matches_cpu(&ctx);
     }
 
     #[test]
+    #[ignore = "requires explicit CUDA runtime validation"]
     fn test_cuda_mnemonic_pipeline() {
-        if !is_available() {
-            eprintln!("No CUDA device available, skipping CUDA mnemonic pipeline test");
+        let Some(ctx) = runtime_cuda_ctx("test_cuda_mnemonic_pipeline") else {
             return;
-        }
-
-        let ctx = match GpuContext::new() {
-            Ok(ctx) => ctx,
-            Err(err) => {
-                eprintln!("Could not initialize CUDA backend: {err}, skipping");
-                return;
-            }
         };
 
         backend_tests::assert_mnemonic_pipeline(&ctx);
@@ -607,33 +715,27 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires explicit CUDA runtime validation"]
     fn test_cuda_mnemonic_module_keeps_diagnostic_kernels() {
-        if !is_available() {
-            eprintln!("No CUDA device available, skipping CUDA diagnostic module test");
+        let Some(ctx) = runtime_cuda_ctx("test_cuda_mnemonic_module_keeps_diagnostic_kernels")
+        else {
             return;
-        }
-
-        let ctx = match GpuContext::new() {
-            Ok(ctx) => ctx,
-            Err(err) => {
-                eprintln!("Could not initialize CUDA backend: {err}, skipping");
-                return;
-            }
         };
 
-        if let Some(module) = ctx.mnemonic_module() {
-            module
-                .load_function("test_sha512_kernel")
-                .expect("missing diagnostic kernel");
-            module
-                .load_function("test_hmac_sha512_kernel")
-                .expect("missing diagnostic kernel");
-            module
-                .load_function("test_pbkdf2_kernel")
-                .expect("missing diagnostic kernel");
-            module
-                .load_function("test_bip32_kernel")
-                .expect("missing diagnostic kernel");
-        }
+        let module = ctx.mnemonic_module().expect(
+            "mnemonic diagnostic module should be available during CUDA runtime validation",
+        );
+        module
+            .load_function("test_sha512_kernel")
+            .expect("missing diagnostic kernel");
+        module
+            .load_function("test_hmac_sha512_kernel")
+            .expect("missing diagnostic kernel");
+        module
+            .load_function("test_pbkdf2_kernel")
+            .expect("missing diagnostic kernel");
+        module
+            .load_function("test_bip32_kernel")
+            .expect("missing diagnostic kernel");
     }
 }

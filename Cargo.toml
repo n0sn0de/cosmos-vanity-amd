@@ -34,7 +34,7 @@ bech32 = "0.11"
 
 # GPU
 ocl = "0.19"
-cudarc = { version = "0.19.4", default-features = false, features = ["std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-12060"] }
+cudarc = { version = "0.19.4", default-features = false, features = ["std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-11080"] }
 
 # CLI & IO
 clap = { version = "4", features = ["derive"] }
