@@ -16,11 +16,10 @@ This repo contains:
 | Linux | OpenCL | validated on AMD | `cargo test --workspace --features "opencl cuda"` passes on an RX 9070 XT |
 | Linux | CUDA | compile-validated, runtime tests auto-skip without driver | `cargo test --workspace --features cuda` passes locally; CUDA parity tests run automatically when a CUDA driver is present |
 | Windows (MSVC) | CPU | build-validated | `cargo xwin build --release --target x86_64-pc-windows-msvc -p cosmos-vanity-cli` with `clang-cl`, `lld-link`, and `llvm-ar` available on `PATH` |
-| Windows (MSVC) | CUDA | build-validated | `cargo xwin build --release --target x86_64-pc-windows-msvc -p cosmos-vanity-cli --features cuda` with `clang-cl`, `lld-link`, and `llvm-ar` available on `PATH` |
+| Windows (MSVC) | CUDA | runtime-validated on RTX 3070 | Win11/MSVC release build passed `test_cuda_hash_matches_cpu`, `test_cuda_secp256k1_known_vector`, `test_cuda_secp256k1_matches_cpu`, `test_cuda_mnemonic_pipeline`, plus release CLI smoke in raw mode and mnemonic mode via PTX fallback |
 
 Notes:
 - I only claim runtime validation where it was actually exercised.
-- Remote SSH access to the available NVIDIA/Windows hosts was not usable from this environment during this pass, so those hosts were not counted as validation evidence.
 - GitHub Actions now covers Linux and Windows build/test automation so future regressions are visible quickly.
 
 ## Performance
@@ -32,6 +31,17 @@ Benchmarked on AMD Radeon RX 9070 XT (gfx1201, 32 CUs, ROCm/OpenCL):
 | GPU raw | ~1,000,000/s | Private key → secp256k1 → hash on GPU |
 | GPU mnemonic | ~21,000/s | Full BIP-39 + BIP-32 + secp256k1 pipeline on GPU |
 | CPU mnemonic | ~12,000/s | CPU-only search |
+
+Benchmarked on Windows 11 with an NVIDIA GeForce RTX 3070 (46 SMs, MSVC release build, CUDA via PTX fallback on this toolkit):
+
+| Mode | Throughput | Description |
+|---|---:|---|
+| GPU raw | ~1,124,000/s sustained | `--gpu-api cuda --key-mode raw`; observed steady-state plateau from `1,123,703/s` to `1,124,114/s` after compile warm-up |
+| GPU mnemonic | ~18,700/s sustained | `--gpu-api cuda --key-mode mnemonic --words 12`; observed steady-state plateau from `18,609/s` to `18,789/s` after compile warm-up |
+
+Benchmark note:
+- Windows numbers were taken from live search progress on an impossible 9-character prefix so compile/JIT time was excluded from the reported throughput.
+- On this Win11 RTX 3070 machine, the external `nvcc` CUBIN path currently fails, so both CUDA measurements ran through the PTX fallback path.
 
 ## Backend model
 
