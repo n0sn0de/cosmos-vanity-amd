@@ -3,8 +3,9 @@
 //! Command-line interface for Cosmos vanity address generation
 //! with AMD GPU acceleration via ROCm/OpenCL.
 
-use std::io::Read;
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -75,6 +76,10 @@ enum Commands {
         #[arg(long)]
         unsafe_print_secrets: bool,
 
+        /// Write secret material to a new 0600 JSON file instead of stdout
+        #[arg(long, value_name = "FILE", conflicts_with = "unsafe_print_secrets")]
+        secret_file: Option<PathBuf>,
+
         /// Maximum number of matches to find
         #[arg(short = 'n', long, default_value = "1")]
         max_matches: usize,
@@ -140,6 +145,10 @@ enum Commands {
         /// Print mnemonic material to stdout/JSON (unsafe; disabled by default)
         #[arg(long)]
         unsafe_print_secrets: bool,
+
+        /// Write secret material to a new 0600 JSON file instead of stdout
+        #[arg(long, value_name = "FILE", conflicts_with = "unsafe_print_secrets")]
+        secret_file: Option<PathBuf>,
     },
 }
 
@@ -214,6 +223,31 @@ fn parse_mnemonic_words(value: &str) -> std::result::Result<u8, String> {
     }
 }
 
+fn write_secret_file(path: &Path, secret: &serde_json::Value) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to create secret file {}", path.display()))?;
+    serde_json::to_writer_pretty(&mut file, secret)
+        .with_context(|| format!("failed to write secret file {}", path.display()))?;
+    file.write_all(b"\n")
+        .with_context(|| format!("failed to finalize secret file {}", path.display()))?;
+
+    Ok(())
+}
+
+fn secret_file_display(secret_file: Option<&Path>) -> Option<String> {
+    secret_file.map(|path| path.display().to_string())
+}
+
 fn read_mnemonic_input(mnemonic_file: Option<PathBuf>, mnemonic_stdin: bool) -> Result<String> {
     let mut mnemonic = String::new();
 
@@ -262,6 +296,7 @@ fn main() -> Result<()> {
             checkpoint_interval,
             words,
             unsafe_print_secrets,
+            secret_file,
         } => {
             let vanity_pattern = match match_type {
                 MatchType::Prefix => VanityPattern::Prefix(pattern),
@@ -279,6 +314,9 @@ fn main() -> Result<()> {
             let effective_mode = resolve_mode(&mode);
 
             let effective_key_mode = key_mode.to_key_mode();
+            if secret_file.is_some() && max_matches != 1 {
+                bail!("--secret-file currently supports exactly one match; use -n 1");
+            }
             if effective_key_mode == KeyMode::Raw && effective_mode != SearchMode::Gpu {
                 bail!(
                     "raw key mode is only supported by the GPU raw pipeline; use `-m gpu -k raw` with a working OpenCL GPU, or switch to `-k mnemonic` for CPU/hybrid search"
@@ -469,7 +507,8 @@ fn main() -> Result<()> {
             let mut found = 0;
             for result in rx.iter() {
                 found += 1;
-                pb.suspend(|| {
+                pb.suspend(|| -> Result<()> {
+                    let secret_path = secret_file.as_deref();
                     let empty_key = String::new();
                     if effective_key_mode == KeyMode::Raw {
                         let privkey_hex = result.private_key_hex.as_ref().unwrap_or(&empty_key);
@@ -477,6 +516,20 @@ fn main() -> Result<()> {
                         let verified = cosmos_vanity_verify::verify_privkey_address(
                             privkey_hex, &hrp, &result.address,
                         ).unwrap_or(false);
+
+                        if verified {
+                            if let Some(path) = secret_path {
+                                write_secret_file(
+                                    path,
+                                    &serde_json::json!({
+                                        "address": &result.address,
+                                        "private_key": privkey_hex,
+                                        "hrp": &hrp,
+                                        "key_mode": "raw",
+                                    }),
+                                )?;
+                            }
+                        }
 
                         match cli.format {
                             OutputFormat::Text => {
@@ -488,12 +541,19 @@ fn main() -> Result<()> {
                                 } else {
                                     println!("   Private Key: <redacted; use --unsafe-print-secrets only on a secure terminal>");
                                 }
+                                if verified {
+                                    if let Some(path) = secret_path {
+                                        println!("   Secret File: {}", path.display());
+                                    }
+                                }
                                 println!("   Candidate:   #{}", result.candidate_number);
                                 println!("   Time:        {:.2}s", result.elapsed_secs);
                                 println!("   Verified:    {}", if verified { "✅" } else { "❌" });
                                 println!();
                                 if unsafe_print_secrets {
                                     println!("   ⚠️  SECURITY: Store your private key securely. Anyone with this key controls the wallet.");
+                                } else if verified && secret_path.is_some() {
+                                    println!("   ⚠️  SECURITY: Secret material was written to the requested file and redacted from stdout.");
                                 } else {
                                     println!("   ⚠️  SECURITY: Secret output is redacted by default to avoid terminal/log leakage.");
                                 }
@@ -504,6 +564,7 @@ fn main() -> Result<()> {
                                     "address": result.address,
                                     "private_key": if unsafe_print_secrets { serde_json::json!(privkey_hex) } else { serde_json::Value::Null },
                                     "secrets_redacted": !unsafe_print_secrets,
+                                    "secret_file": if verified { secret_file_display(secret_path) } else { None },
                                     "candidate_number": result.candidate_number,
                                     "elapsed_secs": result.elapsed_secs,
                                     "verified": verified,
@@ -517,62 +578,84 @@ fn main() -> Result<()> {
                             eprintln!("⚠️  Match FAILED verification! Private key does not produce expected address.");
                         }
                     } else {
-                    // Mnemonic mode — verify with mnemonic
-                    match verify_match(
-                        &result.mnemonic,
-                        &result.derivation_path,
-                        &hrp,
-                        &result.address,
-                        &vanity_pattern,
-                    ) {
-                        Ok(verification) if verification.verified => {
-                            match cli.format {
-                                OutputFormat::Text => {
-                                    println!();
-                                    println!("🎯 Match #{found} found!");
-                                    println!("   Address:    {}", result.address);
-                                    if unsafe_print_secrets {
-                                        println!("   Mnemonic:   {}", result.mnemonic);
-                                    } else {
-                                        println!("   Mnemonic:   <redacted; use --unsafe-print-secrets only on a secure terminal>");
-                                    }
-                                    println!("   Path:       {}", result.derivation_path);
-                                    println!("   Candidate:  #{}", result.candidate_number);
-                                    println!("   Time:       {:.2}s", result.elapsed_secs);
-                                    println!("   Verified:   ✅");
-                                    if !unsafe_print_secrets {
-                                        println!();
-                                        println!("   ⚠️  SECURITY: Secret output is redacted by default to avoid terminal/log leakage.");
-                                    }
-                                    println!();
+                        // Mnemonic mode — verify with mnemonic
+                        match verify_match(
+                            &result.mnemonic,
+                            &result.derivation_path,
+                            &hrp,
+                            &result.address,
+                            &vanity_pattern,
+                        ) {
+                            Ok(verification) if verification.verified => {
+                                if let Some(path) = secret_path {
+                                    write_secret_file(
+                                        path,
+                                        &serde_json::json!({
+                                            "address": &result.address,
+                                            "mnemonic": &result.mnemonic,
+                                            "derivation_path": &result.derivation_path,
+                                            "hrp": &hrp,
+                                            "key_mode": "mnemonic",
+                                        }),
+                                    )?;
                                 }
-                                OutputFormat::Json => {
-                                    let json = serde_json::json!({
-                                        "address": result.address,
-                                        "mnemonic": if unsafe_print_secrets { serde_json::json!(result.mnemonic) } else { serde_json::Value::Null },
-                                        "secrets_redacted": !unsafe_print_secrets,
-                                        "derivation_path": result.derivation_path,
-                                        "candidate_number": result.candidate_number,
-                                        "elapsed_secs": result.elapsed_secs,
-                                        "verified": true,
-                                        "key_mode": "mnemonic",
-                                    });
-                                    println!("{}", serde_json::to_string_pretty(&json).unwrap());
+
+                                match cli.format {
+                                    OutputFormat::Text => {
+                                        println!();
+                                        println!("🎯 Match #{found} found!");
+                                        println!("   Address:    {}", result.address);
+                                        if unsafe_print_secrets {
+                                            println!("   Mnemonic:   {}", result.mnemonic);
+                                        } else {
+                                            println!("   Mnemonic:   <redacted; use --unsafe-print-secrets only on a secure terminal>");
+                                        }
+                                        println!("   Path:       {}", result.derivation_path);
+                                        if let Some(path) = secret_path {
+                                            println!("   Secret File: {}", path.display());
+                                        }
+                                        println!("   Candidate:  #{}", result.candidate_number);
+                                        println!("   Time:       {:.2}s", result.elapsed_secs);
+                                        println!("   Verified:   ✅");
+                                        if !unsafe_print_secrets {
+                                            println!();
+                                            if secret_path.is_some() {
+                                                println!("   ⚠️  SECURITY: Secret material was written to the requested file and redacted from stdout.");
+                                            } else {
+                                                println!("   ⚠️  SECURITY: Secret output is redacted by default to avoid terminal/log leakage.");
+                                            }
+                                        }
+                                        println!();
+                                    }
+                                    OutputFormat::Json => {
+                                        let json = serde_json::json!({
+                                            "address": result.address,
+                                            "mnemonic": if unsafe_print_secrets { serde_json::json!(result.mnemonic) } else { serde_json::Value::Null },
+                                            "secrets_redacted": !unsafe_print_secrets,
+                                            "secret_file": secret_file_display(secret_path),
+                                            "derivation_path": result.derivation_path,
+                                            "candidate_number": result.candidate_number,
+                                            "elapsed_secs": result.elapsed_secs,
+                                            "verified": true,
+                                            "key_mode": "mnemonic",
+                                        });
+                                        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+                                    }
                                 }
                             }
-                        }
-                        Ok(verification) => {
-                            eprintln!(
-                                "⚠️  Match FAILED verification: {}",
-                                verification.error.unwrap_or_default()
-                            );
-                        }
-                        Err(e) => {
-                            eprintln!("❌ Verification error: {e}");
+                            Ok(verification) => {
+                                eprintln!(
+                                    "⚠️  Match FAILED verification: {}",
+                                    verification.error.unwrap_or_default()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("❌ Verification error: {e}");
+                            }
                         }
                     }
-                    } // end else (mnemonic mode)
-                });
+                    Ok(())
+                })?;
 
                 if max_matches > 0 && found >= max_matches {
                     searcher.stop();
@@ -635,9 +718,24 @@ fn main() -> Result<()> {
             hrp,
             path,
             unsafe_print_secrets,
+            secret_file,
         } => {
             let key = cosmos_vanity_keyderiv::generate_random_keypair_with_path(&path)?;
             let address = cosmos_vanity_address::pubkey_to_bech32(key.public_key_bytes(), &hrp)?;
+            let secret_path = secret_file.as_deref();
+
+            if let Some(path) = secret_path {
+                write_secret_file(
+                    path,
+                    &serde_json::json!({
+                        "address": &address,
+                        "mnemonic": key.mnemonic(),
+                        "derivation_path": key.derivation_path(),
+                        "hrp": &hrp,
+                        "key_mode": "mnemonic",
+                    }),
+                )?;
+            }
 
             match cli.format {
                 OutputFormat::Text => {
@@ -648,9 +746,16 @@ fn main() -> Result<()> {
                         println!("Mnemonic: <redacted; use --unsafe-print-secrets only on a secure terminal>");
                     }
                     println!("Path:     {}", key.derivation_path());
+                    if let Some(path) = secret_path {
+                        println!("Secret File: {}", path.display());
+                    }
                     if !unsafe_print_secrets {
                         println!();
-                        println!("⚠️  SECURITY: Secret output is redacted by default to avoid terminal/log leakage.");
+                        if secret_path.is_some() {
+                            println!("⚠️  SECURITY: Secret material was written to the requested file and redacted from stdout.");
+                        } else {
+                            println!("⚠️  SECURITY: Secret output is redacted by default to avoid terminal/log leakage.");
+                        }
                     }
                 }
                 OutputFormat::Json => {
@@ -658,6 +763,7 @@ fn main() -> Result<()> {
                         "address": address,
                         "mnemonic": if unsafe_print_secrets { serde_json::json!(key.mnemonic()) } else { serde_json::Value::Null },
                         "secrets_redacted": !unsafe_print_secrets,
+                        "secret_file": secret_file_display(secret_path),
                         "derivation_path": key.derivation_path(),
                     });
                     println!("{}", serde_json::to_string_pretty(&json).unwrap());

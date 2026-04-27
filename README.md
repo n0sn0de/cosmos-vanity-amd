@@ -112,8 +112,11 @@ cargo build --release --features opencl
 # Secret material is redacted unless --unsafe-print-secrets is set.
 cosmos-vanity search -p abc
 
-# With mnemonic phrase output (12-word, Keplr compatible)
+# With mnemonic phrase generation (12-word, Keplr compatible; redacted by default)
 cosmos-vanity search -p abc -k mnemonic
+
+# Export the generated secret to a new 0600 JSON file
+cosmos-vanity search -p abc -k mnemonic --secret-file ./wallet-secret.json
 
 # 24-word mnemonic
 cosmos-vanity search -p abc -k mnemonic -w 24
@@ -159,6 +162,7 @@ Options:
   -m, --mode <MODE>            gpu, hybrid, cpu [default: gpu]
   -k, --key-mode <MODE>        raw, mnemonic [default: raw]
   -w, --words <N>              Mnemonic words: 12 or 24 [default: 12]
+      --secret-file <FILE>     Write secret material to a new 0600 JSON file
       --unsafe-print-secrets   Print mnemonic/private key material to stdout/JSON
   -j, --threads <N>            CPU threads [default: all cores]
   -n, --max-matches <N>        Stop after N matches [default: 1]
@@ -170,8 +174,11 @@ Options:
 ### Other commands
 
 ```bash
-# Generate a random address
+# Generate a random address (secret redacted by default)
 cosmos-vanity generate --hrp cosmos
+
+# Generate and export the mnemonic to a new 0600 JSON file
+cosmos-vanity generate --hrp cosmos --secret-file ./wallet-secret.json
 
 # Verify a mnemonic produces an address without exposing it in argv
 cosmos-vanity verify --mnemonic-file ./mnemonic.txt --address "cosmos1..."
@@ -209,7 +216,7 @@ Note: letters `b`, `i`, `o`, `1` are NOT valid in Bech32.
 ### ⚠️ CRITICAL
 
 - **Mnemonic/private key = full wallet control.** Never share, log, or store unencrypted.
-- **Secret output is redacted by default.** Use `--unsafe-print-secrets` only on a trusted, non-logging terminal when you intentionally need stdout/JSON secret material.
+- **Secret output is redacted by default.** Prefer `--secret-file <FILE>` to export generated secrets to a new `0600` JSON file. Use `--unsafe-print-secrets` only on a trusted, non-logging terminal when you intentionally need stdout/JSON secret material.
 - **Do not pass mnemonics in argv.** `verify` accepts `--mnemonic-file` or `--mnemonic-stdin` to avoid shell history and process-list leakage.
 - **Raw mode is GPU-only.** If the OpenCL raw pipeline is unavailable, the command fails instead of silently falling back to mnemonic/CPU search.
 - **Zeroize** — sensitive memory is cleared on drop via the `zeroize` crate where practical.
