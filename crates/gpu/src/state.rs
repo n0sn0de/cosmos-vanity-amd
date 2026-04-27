@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use zeroize::Zeroize;
 
 /// Persistent search state for resuming interrupted searches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,13 +40,31 @@ pub struct SearchState {
 }
 
 /// A serializable search result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SerializableResult {
     pub address: String,
     pub mnemonic: String,
     pub derivation_path: String,
     pub found_at: DateTime<Utc>,
     pub candidate_number: u64,
+}
+
+impl std::fmt::Debug for SerializableResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SerializableResult")
+            .field("address", &self.address)
+            .field("mnemonic", &"<redacted>")
+            .field("derivation_path", &self.derivation_path)
+            .field("found_at", &self.found_at)
+            .field("candidate_number", &self.candidate_number)
+            .finish()
+    }
+}
+
+impl Drop for SerializableResult {
+    fn drop(&mut self) {
+        self.mnemonic.zeroize();
+    }
 }
 
 impl SearchState {
@@ -123,6 +142,22 @@ mod tests {
 
         assert_eq!(state.candidates_checked, 1000);
         assert_eq!(state.avg_speed, 500.0);
+    }
+
+    #[test]
+    fn test_serializable_result_debug_redacts_mnemonic() {
+        let result = SerializableResult {
+            address: "cosmos1test...".to_string(),
+            mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+                .to_string(),
+            derivation_path: "m/44'/118'/0'/0/0".to_string(),
+            found_at: Utc::now(),
+            candidate_number: 42,
+        };
+
+        let debug = format!("{result:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("abandon abandon"));
     }
 
     #[test]
