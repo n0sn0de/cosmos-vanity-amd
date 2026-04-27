@@ -3,17 +3,19 @@
 //! Command-line interface for Cosmos vanity address generation
 //! with AMD GPU acceleration via ROCm/OpenCL.
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use cosmos_vanity_address::VanityPattern;
 use cosmos_vanity_gpu::{KeyMode, SearchConfig, SearchMode, VanitySearcher};
+use cosmos_vanity_keyderiv::DEFAULT_COSMOS_PATH;
 use cosmos_vanity_verify::verify_match;
 
 /// Cosmos Vanity Address Generator — AMD GPU accelerated
@@ -66,8 +68,12 @@ enum Commands {
         key_mode: KeyModeArg,
 
         /// Mnemonic word count: 12 (128-bit, Keplr default) or 24 (256-bit)
-        #[arg(short = 'w', long, default_value = "12")]
+        #[arg(short = 'w', long, default_value = "12", value_parser = parse_mnemonic_words)]
         words: u8,
+
+        /// Print mnemonic/private key material to stdout/JSON (unsafe; disabled by default)
+        #[arg(long)]
+        unsafe_print_secrets: bool,
 
         /// Maximum number of matches to find
         #[arg(short = 'n', long, default_value = "1")]
@@ -95,9 +101,18 @@ enum Commands {
 
     /// Verify a mnemonic produces a specific address
     Verify {
-        /// The mnemonic phrase
-        #[arg(short, long)]
-        mnemonic: String,
+        /// Read the mnemonic phrase from a file instead of exposing it in argv
+        #[arg(
+            long,
+            value_name = "FILE",
+            conflicts_with = "mnemonic_stdin",
+            required_unless_present = "mnemonic_stdin"
+        )]
+        mnemonic_file: Option<PathBuf>,
+
+        /// Read the mnemonic phrase from standard input instead of exposing it in argv
+        #[arg(long, conflicts_with = "mnemonic_file")]
+        mnemonic_stdin: bool,
 
         /// Expected address
         #[arg(short, long)]
@@ -121,6 +136,10 @@ enum Commands {
         /// Derivation path
         #[arg(long, default_value = "m/44'/118'/0'/0/0")]
         path: String,
+
+        /// Print mnemonic material to stdout/JSON (unsafe; disabled by default)
+        #[arg(long)]
+        unsafe_print_secrets: bool,
     },
 }
 
@@ -143,6 +162,7 @@ enum SearchModeArg {
 }
 
 impl SearchModeArg {
+    #[cfg_attr(not(feature = "opencl"), allow(dead_code))]
     fn to_search_mode(&self) -> SearchMode {
         match self {
             SearchModeArg::Gpu => SearchMode::Gpu,
@@ -183,6 +203,39 @@ enum OutputFormat {
     Json,
 }
 
+fn parse_mnemonic_words(value: &str) -> std::result::Result<u8, String> {
+    match value.parse::<u8>() {
+        Ok(12) => Ok(12),
+        Ok(24) => Ok(24),
+        Ok(other) => Err(format!(
+            "invalid mnemonic word count: {other}; supported values are 12 or 24"
+        )),
+        Err(e) => Err(format!("invalid mnemonic word count: {e}")),
+    }
+}
+
+fn read_mnemonic_input(mnemonic_file: Option<PathBuf>, mnemonic_stdin: bool) -> Result<String> {
+    let mut mnemonic = String::new();
+
+    if mnemonic_stdin {
+        std::io::stdin()
+            .read_to_string(&mut mnemonic)
+            .context("failed to read mnemonic from stdin")?;
+    } else if let Some(path) = mnemonic_file {
+        mnemonic = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read mnemonic from {}", path.display()))?;
+    } else {
+        bail!("provide --mnemonic-file or --mnemonic-stdin");
+    }
+
+    let mnemonic = mnemonic.trim().to_string();
+    if mnemonic.is_empty() {
+        bail!("mnemonic input is empty");
+    }
+
+    Ok(mnemonic)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -208,6 +261,7 @@ fn main() -> Result<()> {
             state_file,
             checkpoint_interval,
             words,
+            unsafe_print_secrets,
         } => {
             let vanity_pattern = match match_type {
                 MatchType::Prefix => VanityPattern::Prefix(pattern),
@@ -225,11 +279,17 @@ fn main() -> Result<()> {
             let effective_mode = resolve_mode(&mode);
 
             let effective_key_mode = key_mode.to_key_mode();
+            if effective_key_mode == KeyMode::Raw && effective_mode != SearchMode::Gpu {
+                bail!(
+                    "raw key mode is only supported by the GPU raw pipeline; use `-m gpu -k raw` with a working OpenCL GPU, or switch to `-k mnemonic` for CPU/hybrid search"
+                );
+            }
+            let _use_default_derivation_path = path == DEFAULT_COSMOS_PATH;
 
             let config = SearchConfig {
                 pattern: vanity_pattern.clone(),
                 hrp: hrp.clone(),
-                derivation_path: path,
+                derivation_path: path.clone(),
                 num_threads: threads.unwrap_or_else(num_cpus::get),
                 mode: effective_mode,
                 key_mode: effective_key_mode,
@@ -281,32 +341,36 @@ fn main() -> Result<()> {
                     #[cfg(feature = "opencl")]
                     {
                         if effective_key_mode == KeyMode::Raw {
-                            match searcher.search_gpu_raw() {
+                            searcher.search_gpu_raw().context(
+                                "raw key mode requires a working OpenCL GPU with the secp256k1 kernel; refusing to fall back to mnemonic/CPU search",
+                            )?
+                        } else if _use_default_derivation_path {
+                            // Try GPU mnemonic pipeline first (PBKDF2+BIP32+secp256k1 on GPU).
+                            // It is only correct for the default Cosmos derivation path.
+                            match searcher.search_gpu_mnemonic() {
                                 Ok(rx) => rx,
                                 Err(e) => {
-                                    eprintln!("⚠️  GPU raw mode failed ({e}), falling back to mnemonic GPU mode");
+                                    eprintln!("⚠️  GPU mnemonic pipeline failed ({e}), falling back to CPU-derived GPU mnemonic mode");
                                     match searcher.search_gpu_pure() {
                                         Ok(rx) => rx,
                                         Err(e2) => {
-                                            eprintln!("⚠️  GPU init failed ({e2}), falling back to CPU");
+                                            eprintln!(
+                                                "⚠️  GPU init failed ({e2}), falling back to CPU"
+                                            );
                                             searcher.search_cpu()?
                                         }
                                     }
                                 }
                             }
                         } else {
-                            // Try GPU mnemonic pipeline first (PBKDF2+BIP32+secp256k1 on GPU)
-                            match searcher.search_gpu_mnemonic() {
+                            eprintln!(
+                                "⚠️  Custom derivation path requested; skipping optimized GPU mnemonic pipeline because it only supports {DEFAULT_COSMOS_PATH}"
+                            );
+                            match searcher.search_gpu_pure() {
                                 Ok(rx) => rx,
                                 Err(e) => {
-                                    eprintln!("⚠️  GPU mnemonic pipeline failed ({e}), falling back to CPU mnemonic GPU mode");
-                                    match searcher.search_gpu_pure() {
-                                        Ok(rx) => rx,
-                                        Err(e2) => {
-                                            eprintln!("⚠️  GPU init failed ({e2}), falling back to CPU");
-                                            searcher.search_cpu()?
-                                        }
-                                    }
+                                    eprintln!("⚠️  GPU init failed ({e}), falling back to CPU");
+                                    searcher.search_cpu()?
                                 }
                             }
                         }
@@ -419,18 +483,27 @@ fn main() -> Result<()> {
                                 println!();
                                 println!("🎯 Match #{found} found!");
                                 println!("   Address:     {}", result.address);
-                                println!("   Private Key: {} (KEEP SECRET!)", privkey_hex);
+                                if unsafe_print_secrets {
+                                    println!("   Private Key: {} (KEEP SECRET!)", privkey_hex);
+                                } else {
+                                    println!("   Private Key: <redacted; use --unsafe-print-secrets only on a secure terminal>");
+                                }
                                 println!("   Candidate:   #{}", result.candidate_number);
                                 println!("   Time:        {:.2}s", result.elapsed_secs);
                                 println!("   Verified:    {}", if verified { "✅" } else { "❌" });
                                 println!();
-                                println!("   ⚠️  SECURITY: Store your private key securely. Anyone with this key controls the wallet.");
+                                if unsafe_print_secrets {
+                                    println!("   ⚠️  SECURITY: Store your private key securely. Anyone with this key controls the wallet.");
+                                } else {
+                                    println!("   ⚠️  SECURITY: Secret output is redacted by default to avoid terminal/log leakage.");
+                                }
                                 println!();
                             }
                             OutputFormat::Json => {
                                 let json = serde_json::json!({
                                     "address": result.address,
-                                    "private_key": privkey_hex,
+                                    "private_key": if unsafe_print_secrets { serde_json::json!(privkey_hex) } else { serde_json::Value::Null },
+                                    "secrets_redacted": !unsafe_print_secrets,
                                     "candidate_number": result.candidate_number,
                                     "elapsed_secs": result.elapsed_secs,
                                     "verified": verified,
@@ -458,17 +531,26 @@ fn main() -> Result<()> {
                                     println!();
                                     println!("🎯 Match #{found} found!");
                                     println!("   Address:    {}", result.address);
-                                    println!("   Mnemonic:   {}", result.mnemonic);
+                                    if unsafe_print_secrets {
+                                        println!("   Mnemonic:   {}", result.mnemonic);
+                                    } else {
+                                        println!("   Mnemonic:   <redacted; use --unsafe-print-secrets only on a secure terminal>");
+                                    }
                                     println!("   Path:       {}", result.derivation_path);
                                     println!("   Candidate:  #{}", result.candidate_number);
                                     println!("   Time:       {:.2}s", result.elapsed_secs);
                                     println!("   Verified:   ✅");
+                                    if !unsafe_print_secrets {
+                                        println!();
+                                        println!("   ⚠️  SECURITY: Secret output is redacted by default to avoid terminal/log leakage.");
+                                    }
                                     println!();
                                 }
                                 OutputFormat::Json => {
                                     let json = serde_json::json!({
                                         "address": result.address,
-                                        "mnemonic": result.mnemonic,
+                                        "mnemonic": if unsafe_print_secrets { serde_json::json!(result.mnemonic) } else { serde_json::Value::Null },
+                                        "secrets_redacted": !unsafe_print_secrets,
                                         "derivation_path": result.derivation_path,
                                         "candidate_number": result.candidate_number,
                                         "elapsed_secs": result.elapsed_secs,
@@ -528,11 +610,13 @@ fn main() -> Result<()> {
         }
 
         Commands::Verify {
-            mnemonic,
+            mnemonic_file,
+            mnemonic_stdin,
             address,
             hrp,
             path,
         } => {
+            let mnemonic = read_mnemonic_input(mnemonic_file, mnemonic_stdin)?;
             let verified = cosmos_vanity_verify::verify_address(&mnemonic, &path, &hrp, &address)?;
 
             if verified {
@@ -547,20 +631,33 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Generate { hrp, path } => {
+        Commands::Generate {
+            hrp,
+            path,
+            unsafe_print_secrets,
+        } => {
             let key = cosmos_vanity_keyderiv::generate_random_keypair_with_path(&path)?;
             let address = cosmos_vanity_address::pubkey_to_bech32(key.public_key_bytes(), &hrp)?;
 
             match cli.format {
                 OutputFormat::Text => {
                     println!("Address:  {address}");
-                    println!("Mnemonic: {}", key.mnemonic());
+                    if unsafe_print_secrets {
+                        println!("Mnemonic: {}", key.mnemonic());
+                    } else {
+                        println!("Mnemonic: <redacted; use --unsafe-print-secrets only on a secure terminal>");
+                    }
                     println!("Path:     {}", key.derivation_path());
+                    if !unsafe_print_secrets {
+                        println!();
+                        println!("⚠️  SECURITY: Secret output is redacted by default to avoid terminal/log leakage.");
+                    }
                 }
                 OutputFormat::Json => {
                     let json = serde_json::json!({
                         "address": address,
-                        "mnemonic": key.mnemonic(),
+                        "mnemonic": if unsafe_print_secrets { serde_json::json!(key.mnemonic()) } else { serde_json::Value::Null },
+                        "secrets_redacted": !unsafe_print_secrets,
                         "derivation_path": key.derivation_path(),
                     });
                     println!("{}", serde_json::to_string_pretty(&json).unwrap());

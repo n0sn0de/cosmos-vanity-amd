@@ -435,12 +435,12 @@ impl GpuContext {
 
     /// Run the full mnemonic pipeline on GPU.
     /// Takes mnemonic UTF-8 strings (zero-padded to 256 bytes each) + their lengths.
-    /// Returns (derived_privkeys: N×32, hashes: N×20, matches: N×u32).
+    /// Returns only address hashes and match flags; derived private keys stay on the device side.
     pub fn mnemonic_batch(
         &self,
         mnemonics_flat: &[u8],  // N × 256 bytes, zero-padded
         mnemonic_lens: &[u32],  // N lengths
-    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u32>), GpuError> {
+    ) -> Result<(Vec<u8>, Vec<u32>), GpuError> {
         let program = self.mnemonic_program.as_ref().ok_or_else(|| {
             GpuError::Ocl(ocl::Error::from("Mnemonic pipeline kernel not compiled"))
         })?;
@@ -503,9 +503,6 @@ impl GpuContext {
         unsafe { kernel.enq()?; }
         self.queue.finish()?;
 
-        let mut privkeys = vec![0u8; n * 32];
-        privkeys_buf.read(&mut privkeys).enq()?;
-
         let mut hashes = vec![0u8; n * 20];
         hashes_buf.read(&mut hashes).enq()?;
 
@@ -513,7 +510,7 @@ impl GpuContext {
         matches_buf.read(&mut matches).enq()?;
 
         debug!("GPU mnemonic batch complete: {} candidates processed", n);
-        Ok((privkeys, hashes, matches))
+        Ok((hashes, matches))
     }
 }
 
@@ -692,7 +689,6 @@ mod tests {
         // Expected compressed pubkey for privkey=1 (generator point G):
         // 0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
         let expected_hex = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-        let expected = hex::decode(expected_hex).unwrap();
 
         assert_eq!(
             pubkeys.len(), 33,
@@ -832,7 +828,7 @@ mod tests {
         let mut padded = vec![0u8; 256];
         padded[..mnemonic_bytes.len()].copy_from_slice(mnemonic_bytes);
 
-        let (privkeys, hashes, _matches) = ctx
+        let (hashes, _matches) = ctx
             .mnemonic_batch(&padded, &[mnemonic_len])
             .expect("GPU mnemonic pipeline failed");
 
@@ -842,15 +838,6 @@ mod tests {
             cosmos_vanity_keyderiv::DEFAULT_COSMOS_PATH,
         ).unwrap();
         let cpu_addr = cosmos_vanity_address::pubkey_to_bech32(cpu_key.public_key_bytes(), "cosmos").unwrap();
-
-        // GPU derived privkey should match CPU
-        let gpu_privkey = &privkeys[..32];
-        assert_eq!(
-            cpu_key.secret_key_bytes(), gpu_privkey,
-            "Private key mismatch!\n  CPU: {}\n  GPU: {}",
-            hex::encode(cpu_key.secret_key_bytes()),
-            hex::encode(gpu_privkey),
-        );
 
         // GPU hash → bech32 should match CPU address
         let mut gpu_addr_bytes = [0u8; 20];
@@ -873,6 +860,7 @@ mod diagnostic_tests {
     use super::*;
     use ocl::{Buffer, Kernel};
 
+    #[allow(dead_code)]
     fn get_mnemonic_program() -> (GpuContext, ocl::Program) {
         let ctx = GpuContext::new().expect("No GPU");
         assert!(ctx.has_mnemonic_kernel(), "No mnemonic kernel");

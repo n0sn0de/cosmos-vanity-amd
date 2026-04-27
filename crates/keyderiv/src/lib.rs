@@ -36,6 +36,9 @@ pub enum KeyDerivError {
 
     #[error("invalid derivation path: {0}")]
     InvalidPath(String),
+
+    #[error("invalid mnemonic word count: {0}; supported values are 12 or 24")]
+    InvalidMnemonicWordCount(u8),
 }
 
 /// A derived keypair with its associated mnemonic and derivation path.
@@ -46,12 +49,8 @@ pub enum KeyDerivError {
 /// [`ZeroizeOnDrop`] to ensure secrets are cleared from memory when dropped.
 #[derive(Clone, ZeroizeOnDrop)]
 pub struct DerivedKey {
-    /// The BIP-39 mnemonic phrase (24 words)
-    #[zeroize(skip)] // String doesn't impl Zeroize in the way we need; we handle manually
+    /// The BIP-39 mnemonic phrase (12 or 24 words)
     mnemonic_phrase: String,
-
-    /// Raw seed bytes derived from the mnemonic
-    seed: Vec<u8>,
 
     /// The derived private key bytes (32 bytes)
     secret_key_bytes: Vec<u8>,
@@ -119,8 +118,15 @@ pub fn generate_random_keypair_with_path(path: &str) -> Result<DerivedKey, KeyDe
 
 /// Generate a random BIP-39 mnemonic with the specified word count and derive the keypair.
 /// Supported: 12 words (128-bit entropy) or 24 words (256-bit entropy).
-pub fn generate_random_keypair_with_words(path: &str, words: u8) -> Result<DerivedKey, KeyDerivError> {
-    let entropy_len = if words == 12 { 16 } else { 32 };
+pub fn generate_random_keypair_with_words(
+    path: &str,
+    words: u8,
+) -> Result<DerivedKey, KeyDerivError> {
+    let entropy_len = match words {
+        12 => 16,
+        24 => 32,
+        other => return Err(KeyDerivError::InvalidMnemonicWordCount(other)),
+    };
     let mut entropy = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut entropy[..entropy_len]);
     let mnemonic = Mnemonic::from_entropy(&entropy[..entropy_len])
@@ -139,7 +145,7 @@ pub fn derive_keypair_from_mnemonic(
         .map_err(|e: bip39::Error| KeyDerivError::Bip39(e.to_string()))?;
 
     // BIP-39 seed (no passphrase — standard for Cosmos wallets)
-    let seed = mnemonic.to_seed("");
+    let mut seed = mnemonic.to_seed("");
 
     // Parse derivation path
     let derivation_path: DerivationPath = path
@@ -159,11 +165,14 @@ pub fn derive_keypair_from_mnemonic(
     let secret_key = derived.private_key;
     let public_key = secret_key.public_key(&secp);
 
+    let secret_key_bytes = secret_key.secret_bytes().to_vec();
+    let public_key_bytes = public_key.serialize().to_vec();
+    seed.zeroize();
+
     Ok(DerivedKey {
         mnemonic_phrase: mnemonic.to_string(),
-        seed: seed.to_vec(),
-        secret_key_bytes: secret_key.secret_bytes().to_vec(),
-        public_key_bytes: public_key.serialize().to_vec(),
+        secret_key_bytes,
+        public_key_bytes,
         derivation_path: path.to_string(),
     })
 }
@@ -197,6 +206,15 @@ mod tests {
         // Mnemonic should be 24 words
         let words: Vec<&str> = key.mnemonic().split_whitespace().collect();
         assert_eq!(words.len(), 24);
+    }
+
+    #[test]
+    fn test_reject_invalid_word_count() {
+        let result = generate_random_keypair_with_words(DEFAULT_COSMOS_PATH, 13);
+        assert!(matches!(
+            result,
+            Err(KeyDerivError::InvalidMnemonicWordCount(13))
+        ));
     }
 
     #[test]
