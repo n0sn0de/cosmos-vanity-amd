@@ -12,6 +12,7 @@ use cosmos_vanity_address::{pubkey_to_bech32, VanityPattern};
 use cosmos_vanity_keyderiv::generate_random_keypair_with_words;
 #[cfg(feature = "opencl")]
 use cosmos_vanity_keyderiv::DEFAULT_COSMOS_PATH;
+use zeroize::Zeroize;
 
 use crate::state::SearchState;
 
@@ -135,7 +136,7 @@ fn ensure_mnemonic_mode(key_mode: KeyMode, search_name: &str) -> anyhow::Result<
 }
 
 /// A verified search result.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SearchResult {
     /// The matching Bech32 address
     pub address: String,
@@ -154,6 +155,70 @@ pub struct SearchResult {
 
     /// Raw private key hex (only set in raw key mode)
     pub private_key_hex: Option<String>,
+}
+
+impl std::fmt::Debug for SearchResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchResult")
+            .field("address", &self.address)
+            .field("mnemonic", &"<redacted>")
+            .field("derivation_path", &self.derivation_path)
+            .field("candidate_number", &self.candidate_number)
+            .field("elapsed_secs", &self.elapsed_secs)
+            .field(
+                "private_key_hex",
+                &self.private_key_hex.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+impl Drop for SearchResult {
+    fn drop(&mut self) {
+        self.mnemonic.zeroize();
+        if let Some(private_key_hex) = &mut self.private_key_hex {
+            private_key_hex.zeroize();
+        }
+    }
+}
+
+#[cfg(feature = "opencl")]
+fn clear_secret_strings(values: &mut Vec<String>) {
+    for value in values.iter_mut() {
+        value.zeroize();
+    }
+    values.clear();
+}
+
+#[cfg(feature = "opencl")]
+fn clear_secret_bytes(values: &mut Vec<u8>) {
+    values.as_mut_slice().zeroize();
+    values.clear();
+}
+
+#[cfg(feature = "opencl")]
+fn zeroize_keygen_send_error(err: crossbeam_channel::SendError<(Vec<u8>, String, String)>) {
+    let (_, mut mnemonic, _) = err.0;
+    mnemonic.zeroize();
+}
+
+#[cfg(feature = "opencl")]
+fn zeroize_mnemonic_send_error(err: crossbeam_channel::SendError<(Vec<u8>, String)>) {
+    let (mut mnemonic_bytes, mut mnemonic) = err.0;
+    mnemonic_bytes.zeroize();
+    mnemonic.zeroize();
+}
+
+#[cfg(feature = "opencl")]
+fn private_key_hex_prefixed(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(2 + bytes.len() * 2);
+    out.push_str("0x");
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// The main vanity address searcher.
@@ -508,7 +573,8 @@ impl VanitySearcher {
                         let deriv_path = key.derivation_path().to_string();
                         drop(key);
 
-                        if keygen_tx.send((pubkey, mnemonic, deriv_path)).is_err() {
+                        if let Err(err) = keygen_tx.send((pubkey, mnemonic, deriv_path)) {
+                            zeroize_keygen_send_error(err);
                             break;
                         }
                     }
@@ -547,7 +613,7 @@ impl VanitySearcher {
                     }
 
                     pubkeys_flat.clear();
-                    mnemonics.clear();
+                    clear_secret_strings(&mut mnemonics);
                     paths.clear();
 
                     match keygen_rx.recv() {
@@ -617,12 +683,16 @@ impl VanitySearcher {
                             };
 
                             if gpu_result_tx.send(result).is_err() {
+                                clear_secret_strings(&mut mnemonics);
                                 return;
                             }
                         }
                     }
+
+                    clear_secret_strings(&mut mnemonics);
                 }
 
+                clear_secret_strings(&mut mnemonics);
                 tracing::debug!("GPU driver thread exited");
             })?;
 
@@ -729,7 +799,8 @@ impl VanitySearcher {
                         let deriv_path = key.derivation_path().to_string();
                         drop(key);
 
-                        if keygen_tx.send((pubkey, mnemonic, deriv_path)).is_err() {
+                        if let Err(err) = keygen_tx.send((pubkey, mnemonic, deriv_path)) {
+                            zeroize_keygen_send_error(err);
                             break;
                         }
                     }
@@ -798,7 +869,7 @@ impl VanitySearcher {
                             tracing::error!("GPU hashing error: {e}");
                             // Try to continue with next batch
                             buf_a_pubkeys.clear();
-                            buf_a_mnemonics.clear();
+                            clear_secret_strings(&mut buf_a_mnemonics);
                             buf_a_paths.clear();
                             std::mem::swap(&mut buf_a_pubkeys, &mut buf_b_pubkeys);
                             std::mem::swap(&mut buf_a_mnemonics, &mut buf_b_mnemonics);
@@ -857,6 +928,8 @@ impl VanitySearcher {
                             };
 
                             if gpu_result_tx.send(result).is_err() {
+                                clear_secret_strings(&mut buf_a_mnemonics);
+                                clear_secret_strings(&mut buf_b_mnemonics);
                                 return;
                             }
                         }
@@ -864,7 +937,7 @@ impl VanitySearcher {
 
                     // Swap buffers: B becomes the next batch to dispatch, A becomes the fill target
                     buf_a_pubkeys.clear();
-                    buf_a_mnemonics.clear();
+                    clear_secret_strings(&mut buf_a_mnemonics);
                     buf_a_paths.clear();
                     std::mem::swap(&mut buf_a_pubkeys, &mut buf_b_pubkeys);
                     std::mem::swap(&mut buf_a_mnemonics, &mut buf_b_mnemonics);
@@ -875,6 +948,8 @@ impl VanitySearcher {
                     }
                 }
 
+                clear_secret_strings(&mut buf_a_mnemonics);
+                clear_secret_strings(&mut buf_b_mnemonics);
                 tracing::debug!("Pure GPU driver thread exited");
             })?;
 
@@ -966,6 +1041,7 @@ impl VanitySearcher {
                             Ok(r) => r,
                             Err(e) => {
                                 tracing::error!("GPU secp256k1 error: {e}");
+                                clear_secret_bytes(&mut privkeys);
                                 continue;
                             }
                         };
@@ -988,8 +1064,9 @@ impl VanitySearcher {
                             let candidate_num = batch_start + i as u64;
                             let elapsed = start.elapsed().as_secs_f64();
 
-                            // Extract the private key hex
-                            let privkey_hex = format!("0x{}", hex::encode(&privkeys[i * 32..(i + 1) * 32]));
+                            // Extract the private key hex without an intermediate secret string.
+                            let privkey_hex =
+                                private_key_hex_prefixed(&privkeys[i * 32..(i + 1) * 32]);
 
                             tracing::info!(
                                 "🎯 GPU Raw Match! Address: {} (candidate #{})",
@@ -1009,10 +1086,13 @@ impl VanitySearcher {
                             };
 
                             if gpu_result_tx.send(result).is_err() {
+                                clear_secret_bytes(&mut privkeys);
                                 return;
                             }
                         }
                     }
+
+                    clear_secret_bytes(&mut privkeys);
                 }
 
                 tracing::debug!("Raw GPU driver thread exited");
@@ -1095,12 +1175,19 @@ impl VanitySearcher {
                         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut entropy[..entropy_len]);
                         let mnemonic: Mnemonic = match Mnemonic::from_entropy(&entropy[..entropy_len]) {
                             Ok(m) => m,
-                            Err(_) => continue,
+                            Err(_) => {
+                                entropy.zeroize();
+                                continue;
+                            }
                         };
+                        entropy.zeroize();
                         let mnemonic_str = mnemonic.to_string();
                         let mnemonic_bytes = mnemonic_str.as_bytes().to_vec();
 
-                        if mnem_tx.send((mnemonic_bytes, mnemonic_str)).is_err() { break; }
+                        if let Err(err) = mnem_tx.send((mnemonic_bytes, mnemonic_str)) {
+                            zeroize_mnemonic_send_error(err);
+                            break;
+                        }
                     }
                 })?;
         }
@@ -1119,19 +1206,21 @@ impl VanitySearcher {
                     if max_matches > 0 && matches_found.load(Ordering::Relaxed) >= max_matches as u64 { break; }
 
                     // Fill batch
-                    batch_mnemonics_flat.clear();
+                    clear_secret_bytes(&mut batch_mnemonics_flat);
                     batch_lens.clear();
-                    batch_strings.clear();
+                    clear_secret_strings(&mut batch_strings);
 
                     // Block on first item
                     match mnem_rx.recv() {
-                        Ok((bytes, string)) => {
+                        Ok((mut bytes, string)) => {
                             let mut padded = vec![0u8; 256];
                             let len = bytes.len().min(256);
                             padded[..len].copy_from_slice(&bytes[..len]);
                             batch_mnemonics_flat.extend_from_slice(&padded);
                             batch_lens.push(len as u32);
                             batch_strings.push(string);
+                            bytes.zeroize();
+                            padded.as_mut_slice().zeroize();
                         }
                         Err(_) => break,
                     }
@@ -1139,13 +1228,15 @@ impl VanitySearcher {
                     // Drain up to batch_size
                     while batch_lens.len() < batch_size {
                         match mnem_rx.try_recv() {
-                            Ok((bytes, string)) => {
+                            Ok((mut bytes, string)) => {
                                 let mut padded = vec![0u8; 256];
                                 let len = bytes.len().min(256);
                                 padded[..len].copy_from_slice(&bytes[..len]);
                                 batch_mnemonics_flat.extend_from_slice(&padded);
                                 batch_lens.push(len as u32);
                                 batch_strings.push(string);
+                                bytes.zeroize();
+                                padded.as_mut_slice().zeroize();
                             }
                             Err(_) => break,
                         }
@@ -1164,6 +1255,8 @@ impl VanitySearcher {
                         Ok(r) => r,
                         Err(e) => {
                             tracing::error!("GPU mnemonic batch error: {e}");
+                            clear_secret_bytes(&mut batch_mnemonics_flat);
+                            clear_secret_strings(&mut batch_strings);
                             continue;
                         }
                     };
@@ -1200,10 +1293,20 @@ impl VanitySearcher {
                                 private_key_hex: None,
                             };
 
-                            if result_tx.send(result).is_err() { return; }
+                            if result_tx.send(result).is_err() {
+                                clear_secret_bytes(&mut batch_mnemonics_flat);
+                                clear_secret_strings(&mut batch_strings);
+                                return;
+                            }
                         }
                     }
+
+                    clear_secret_bytes(&mut batch_mnemonics_flat);
+                    clear_secret_strings(&mut batch_strings);
                 }
+
+                clear_secret_bytes(&mut batch_mnemonics_flat);
+                clear_secret_strings(&mut batch_strings);
             })?;
 
         Ok(result_rx)
@@ -1236,7 +1339,7 @@ fn fill_batch(
     max_matches: usize,
 ) -> bool {
     pubkeys.clear();
-    mnemonics.clear();
+    clear_secret_strings(mnemonics);
     paths.clear();
 
     // Block on first item
@@ -1288,6 +1391,27 @@ mod tests {
         assert_eq!(format!("{}", SearchMode::Gpu), "gpu");
         assert_eq!(format!("{}", SearchMode::Hybrid), "hybrid");
         assert_eq!(format!("{}", SearchMode::Cpu), "cpu");
+    }
+
+    #[test]
+    fn test_search_result_debug_redacts_secrets() {
+        let result = SearchResult {
+            address: "cosmos1test".to_string(),
+            mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+                .to_string(),
+            derivation_path: "m/44'/118'/0'/0/0".to_string(),
+            candidate_number: 42,
+            elapsed_secs: 1.0,
+            private_key_hex: Some(
+                "0x1111111111111111111111111111111111111111111111111111111111111111"
+                    .to_string(),
+            ),
+        };
+
+        let debug = format!("{result:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("abandon abandon"));
+        assert!(!debug.contains("111111111111"));
     }
 
     #[test]
