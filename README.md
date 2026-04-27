@@ -52,14 +52,14 @@ Benchmarked on AMD Radeon RX 9070 XT (gfx1201, 32 CUs, ROCm 7.2):
 ```
 CPU: Random 32-byte private key → GPU
 GPU: secp256k1(privkey) → pubkey → SHA-256 → RIPEMD-160 → prefix match
-CPU: Verify match, output address + private key
+CPU: Verify match, output address (private key redacted unless --unsafe-print-secrets is set)
 ```
 
 **Mnemonic mode** (BIP-39 compatible):
 ```
 CPU: Random entropy → BIP-39 mnemonic (word lookup) → GPU
 GPU: PBKDF2(mnemonic, 2048 rounds) → BIP-32 derive → secp256k1 → SHA-256 → RIPEMD-160 → match
-CPU: Verify match, output address + mnemonic phrase
+CPU: Verify match, output address (mnemonic redacted unless --unsafe-print-secrets is set)
 ```
 
 ## Build Instructions (Ubuntu 24.04)
@@ -108,7 +108,8 @@ cargo build --release --features opencl
 ### Quick start
 
 ```bash
-# Fastest: raw private key mode (GPU default)
+# Fastest: raw private key mode (GPU build + working OpenCL GPU required)
+# Secret material is redacted unless --unsafe-print-secrets is set.
 cosmos-vanity search -p abc
 
 # With mnemonic phrase output (12-word, Keplr compatible)
@@ -136,8 +137,8 @@ cosmos-vanity search -p abc -m cpu -k mnemonic
 
 | Mode | Flag | Output | Speed |
 |------|------|--------|-------|
-| **raw** | `-k raw` | Hex private key | ~1M/s on GPU |
-| mnemonic | `-k mnemonic` | BIP-39 seed phrase | ~21K/s on GPU |
+| **raw** | `-k raw` | Hex private key (redacted by default) | ~1M/s on GPU only |
+| mnemonic | `-k mnemonic` | BIP-39 seed phrase (redacted by default) | ~21K/s on GPU |
 
 ### Mnemonic word count (`--words`, `-w`)
 
@@ -158,6 +159,7 @@ Options:
   -m, --mode <MODE>            gpu, hybrid, cpu [default: gpu]
   -k, --key-mode <MODE>        raw, mnemonic [default: raw]
   -w, --words <N>              Mnemonic words: 12 or 24 [default: 12]
+      --unsafe-print-secrets   Print mnemonic/private key material to stdout/JSON
   -j, --threads <N>            CPU threads [default: all cores]
   -n, --max-matches <N>        Stop after N matches [default: 1]
       --path <PATH>            BIP-44 derivation path [default: m/44'/118'/0'/0/0]
@@ -171,8 +173,9 @@ Options:
 # Generate a random address
 cosmos-vanity generate --hrp cosmos
 
-# Verify a mnemonic produces an address
-cosmos-vanity verify --mnemonic "word1 word2 ..." --address "cosmos1..."
+# Verify a mnemonic produces an address without exposing it in argv
+cosmos-vanity verify --mnemonic-file ./mnemonic.txt --address "cosmos1..."
+printf '%s' "word1 word2 ..." | cosmos-vanity verify --mnemonic-stdin --address "cosmos1..."
 
 # Run benchmarks
 cosmos-vanity bench --iterations 10000
@@ -206,7 +209,10 @@ Note: letters `b`, `i`, `o`, `1` are NOT valid in Bech32.
 ### ⚠️ CRITICAL
 
 - **Mnemonic/private key = full wallet control.** Never share, log, or store unencrypted.
-- **Zeroize** — sensitive memory is cleared on drop via the `zeroize` crate.
+- **Secret output is redacted by default.** Use `--unsafe-print-secrets` only on a trusted, non-logging terminal when you intentionally need stdout/JSON secret material.
+- **Do not pass mnemonics in argv.** `verify` accepts `--mnemonic-file` or `--mnemonic-stdin` to avoid shell history and process-list leakage.
+- **Raw mode is GPU-only.** If the OpenCL raw pipeline is unavailable, the command fails instead of silently falling back to mnemonic/CPU search.
+- **Zeroize** — sensitive memory is cleared on drop via the `zeroize` crate where practical.
 - **GPU memory** — VRAM may retain data after kernel execution. Power cycle GPU for production keys.
 - **Verification** — every GPU match is independently re-derived and verified on CPU.
 

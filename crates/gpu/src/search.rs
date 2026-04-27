@@ -8,8 +8,10 @@ use std::time::Instant;
 use chrono::Utc;
 use crossbeam_channel::{bounded, Receiver};
 
-use cosmos_vanity_address::{encode_bech32, pubkey_to_bech32, VanityPattern};
-use cosmos_vanity_keyderiv::{generate_random_keypair_with_path, generate_random_keypair_with_words};
+use cosmos_vanity_address::{pubkey_to_bech32, VanityPattern};
+use cosmos_vanity_keyderiv::generate_random_keypair_with_words;
+#[cfg(feature = "opencl")]
+use cosmos_vanity_keyderiv::DEFAULT_COSMOS_PATH;
 
 use crate::state::SearchState;
 
@@ -115,6 +117,23 @@ impl Default for SearchConfig {
     }
 }
 
+fn validate_mnemonic_word_count(words: u8) -> anyhow::Result<()> {
+    match words {
+        12 | 24 => Ok(()),
+        other => anyhow::bail!("invalid mnemonic word count: {other}; supported values are 12 or 24"),
+    }
+}
+
+fn ensure_mnemonic_mode(key_mode: KeyMode, search_name: &str) -> anyhow::Result<()> {
+    if key_mode == KeyMode::Mnemonic {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "{search_name} only supports mnemonic key mode; raw key mode requires GPU raw search"
+        )
+    }
+}
+
 /// A verified search result.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -148,6 +167,10 @@ pub struct VanitySearcher {
 impl VanitySearcher {
     /// Create a new searcher with the given configuration.
     pub fn new(config: SearchConfig) -> anyhow::Result<Self> {
+        if config.key_mode == KeyMode::Mnemonic {
+            validate_mnemonic_word_count(config.mnemonic_words)?;
+        }
+
         let use_gpu = config.mode != SearchMode::Cpu;
 
         // Try to resume from state file
@@ -206,6 +229,9 @@ impl VanitySearcher {
     ///
     /// Returns a receiver that yields results as they're found.
     pub fn search_cpu(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
+        ensure_mnemonic_mode(self.config.key_mode, "CPU search")?;
+        validate_mnemonic_word_count(self.config.mnemonic_words)?;
+
         let (tx, rx) = bounded::<SearchResult>(32);
 
         let start = Instant::now();
@@ -329,6 +355,9 @@ impl VanitySearcher {
     #[cfg(feature = "opencl")]
     pub fn search_hybrid(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
         use crate::opencl::GpuContext;
+
+        ensure_mnemonic_mode(self.config.key_mode, "hybrid search")?;
+        validate_mnemonic_word_count(self.config.mnemonic_words)?;
 
         let gpu_ctx = GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init failed: {e}"))?;
         // Use larger batches to amortize kernel launch overhead
@@ -562,7 +591,7 @@ impl VanitySearcher {
                             .try_into()
                             .expect("20 bytes");
 
-                        let address = match encode_bech32(&gpu_hrp, &hash_bytes) {
+                        let address = match cosmos_vanity_address::encode_bech32(&gpu_hrp, &hash_bytes) {
                             Ok(a) => a,
                             Err(_) => continue,
                         };
@@ -614,6 +643,9 @@ impl VanitySearcher {
     #[cfg(feature = "opencl")]
     pub fn search_gpu_pure(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
         use crate::opencl::GpuContext;
+
+        ensure_mnemonic_mode(self.config.key_mode, "CPU-derived GPU search")?;
+        validate_mnemonic_word_count(self.config.mnemonic_words)?;
 
         let gpu_ctx = GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init failed: {e}"))?;
         // Pure GPU mode uses larger batches for max occupancy
@@ -799,7 +831,7 @@ impl VanitySearcher {
                             .try_into()
                             .expect("20 bytes");
 
-                        let address = match encode_bech32(&gpu_hrp, &hash_bytes) {
+                        let address = match cosmos_vanity_address::encode_bech32(&gpu_hrp, &hash_bytes) {
                             Ok(a) => a,
                             Err(_) => continue,
                         };
@@ -862,6 +894,10 @@ impl VanitySearcher {
     pub fn search_gpu_raw(&mut self) -> anyhow::Result<Receiver<SearchResult>> {
         use crate::opencl::GpuContext;
         use rand::RngCore;
+
+        if self.config.key_mode != KeyMode::Raw {
+            anyhow::bail!("GPU raw search requires raw key mode");
+        }
 
         let gpu_ctx = GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init failed: {e}"))?;
 
@@ -993,6 +1029,14 @@ impl VanitySearcher {
         use crate::opencl::GpuContext;
         use cosmos_vanity_keyderiv::bip39::Mnemonic;
 
+        ensure_mnemonic_mode(self.config.key_mode, "GPU mnemonic pipeline")?;
+        validate_mnemonic_word_count(self.config.mnemonic_words)?;
+        if self.config.derivation_path != DEFAULT_COSMOS_PATH {
+            anyhow::bail!(
+                "GPU mnemonic pipeline supports only {DEFAULT_COSMOS_PATH}; use CPU-derived GPU or CPU mnemonic search for custom paths"
+            );
+        }
+
         let gpu_ctx = GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init failed: {e}"))?;
 
         if !gpu_ctx.has_mnemonic_kernel() {
@@ -1110,8 +1154,10 @@ impl VanitySearcher {
                     let actual_batch = batch_lens.len();
                     if actual_batch == 0 { continue; }
 
-                    // Dispatch to GPU
-                    let (privkeys, hashes, _matches) = match gpu_ctx.mnemonic_batch(
+                    // Dispatch to GPU. The optimized mnemonic kernel derives private keys on-device,
+                    // but production search only needs address hashes; do not copy derived private
+                    // keys back into host memory.
+                    let (hashes, _matches) = match gpu_ctx.mnemonic_batch(
                         &batch_mnemonics_flat,
                         &batch_lens,
                     ) {
@@ -1148,10 +1194,10 @@ impl VanitySearcher {
                             let result = SearchResult {
                                 address,
                                 mnemonic: batch_strings[i].clone(),
-                                derivation_path: "m/44'/118'/0'/0/0".to_string(),
+                                derivation_path: DEFAULT_COSMOS_PATH.to_string(),
                                 candidate_number: candidate_num,
                                 elapsed_secs: elapsed,
-                                private_key_hex: Some(hex::encode(&privkeys[i * 32..(i + 1) * 32])),
+                                private_key_hex: None,
                             };
 
                             if result_tx.send(result).is_err() { return; }
